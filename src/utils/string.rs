@@ -16,6 +16,51 @@ pub fn format_number_with_separators(n: u64) -> String {
     result
 }
 
+/// Format a coin amount with thousands separators.
+/// e.g. `24000000` → `"24,000,000"`, `-500000` → `"-500,000"`
+pub fn format_coins(amount: i64) -> String {
+    let negative = amount < 0;
+    let abs = amount.unsigned_abs();
+    let s = abs.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    let formatted: String = result.chars().rev().collect();
+    if negative { format!("-{}", formatted) } else { formatted }
+}
+
+/// Format an f64 coin amount with comma separators, preserving one decimal
+/// digit when the fractional part is non-zero (e.g. 600000.5 → "600,000.5").
+pub fn format_coins_f64(amount: f64) -> String {
+    let tenths = (amount * 10.0).round() as i64;
+    let int_part = tenths / 10;
+    let frac_digit = (tenths % 10).abs();
+    let int_str = format_coins(int_part);
+    if frac_digit == 0 {
+        int_str
+    } else {
+        format!("{}.{}", int_str, frac_digit)
+    }
+}
+
+/// Calculate Hypixel AH fee based on price tier.
+/// - <10M  → 1%
+/// - <100M → 2%
+/// - ≥100M → 2.5%
+pub fn calculate_ah_fee(price: u64) -> u64 {
+    if price < 10_000_000 {
+        price / 100
+    } else if price < 100_000_000 {
+        price * 2 / 100
+    } else {
+        price * 25 / 1000
+    }
+}
+
 /// Remove Minecraft color codes from text
 /// Format: §x where x is a color code
 pub fn remove_minecraft_colors(text: &str) -> String {

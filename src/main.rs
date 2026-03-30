@@ -18,6 +18,11 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::collections::HashMap;
 use std::time::Instant;
 use frikadellen_baf::utils::restart_process;
+use frikadellen_baf::utils::{format_coins, format_coins_f64, calculate_ah_fee};
+use frikadellen_baf::profit::{
+    parse_cofl_profit_response, parse_cofl_bz_h_total_profit,
+    parse_bz_list_flip_profit, parse_bz_list_flip_detail,
+};
 
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
@@ -50,159 +55,11 @@ const SECS_PER_DAY: f64 = 86400.0;
 /// has fully propagated.
 const DAILY_LIMIT_RESET_BUFFER_SECS: u64 = 5;
 
-/// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
-/// - <10M  → 1%
-/// - <100M → 2%
-/// - ≥100M → 2.5%
-fn calculate_ah_fee(price: u64) -> u64 {
-    if price < 10_000_000 {
-        price / 100
-    } else if price < 100_000_000 {
-        price * 2 / 100
-    } else {
-        price * 25 / 1000
-    }
-}
-
-/// Format a coin amount with thousands separators.
-/// e.g. `24000000` → `"24,000,000"`, `-500000` → `"-500,000"`
-fn format_coins(amount: i64) -> String {
-    let negative = amount < 0;
-    let abs = amount.unsigned_abs();
-    let s = abs.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    let formatted: String = result.chars().rev().collect();
-    if negative { format!("-{}", formatted) } else { formatted }
-}
-
-/// Format an f64 coin amount with comma separators, preserving one decimal
-/// digit when the fractional part is non-zero (e.g. 600000.5 → "600,000.5").
-fn format_coins_f64(amount: f64) -> String {
-    let tenths = (amount * 10.0).round() as i64;
-    let int_part = tenths / 10;
-    let frac_digit = (tenths % 10).abs();
-    let int_str = format_coins(int_part);
-    if frac_digit == 0 {
-        int_str
-    } else {
-        format!("{}.{}", int_str, frac_digit)
-    }
-}
-
 fn is_ban_disconnect(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
     lower.contains("temporarily banned")
         || lower.contains("permanently banned")
         || lower.contains("ban id:")
-}
-
-/// Parse a Coflnet `/cofl profit` response and return the total profit in coins.
-///
-/// Expected format (color-stripped):
-/// `"According to our data <ign> made <amount> in the last <days> days across <N> auctions"`
-///
-/// `<amount>` may be a short notation like `82.7M`, `1.5B`, `250K`, or a plain number.
-fn parse_cofl_profit_response(clean_msg: &str) -> Option<i64> {
-    let rest = clean_msg.strip_prefix("According to our data ")?;
-    let made_idx = rest.find(" made ")?;
-    let after_made = &rest[made_idx + 6..];
-    let end = after_made.find(" in the last ")?;
-    let amount_str = after_made[..end].trim();
-    parse_short_number(amount_str)
-}
-
-/// Parse a human-readable short number like `82.7M`, `1.5B`, `250K`, or `500`.
-fn parse_short_number(s: &str) -> Option<i64> {
-    let s = s.replace(',', "");
-    let (num_part, multiplier) = if let Some(n) = s.strip_suffix('B').or_else(|| s.strip_suffix('b')) {
-        (n, 1_000_000_000f64)
-    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        (n, 1_000_000f64)
-    } else if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
-        (n, 1_000f64)
-    } else {
-        (s.as_str(), 1f64)
-    };
-    let val: f64 = num_part.parse().ok()?;
-    Some((val * multiplier) as i64)
-}
-
-/// Parse a single flip line from `/cofl bz l` output and return the profit.
-///
-/// Expected format (color-stripped):
-///   `"2xJungle Key: 1.05M -> 287K => -768K(1)"`
-///   `"128xWorm Membrane: 7.16M -> 7.91M => 741K(7)"`
-///
-/// The profit is the value between `=> ` and `(`.
-fn parse_bz_list_flip_profit(line: &str) -> Option<i64> {
-    let arrow_idx = line.find("=> ")?;
-    let after_arrow = &line[arrow_idx + 3..];
-    let paren_idx = after_arrow.find('(')?;
-    let profit_str = after_arrow[..paren_idx].trim();
-    parse_short_number(profit_str)
-}
-
-/// Parse a single flip line from `/cofl bz l` output and return item name,
-/// profit, and flip count.
-///
-/// Expected format (color-stripped):
-///   `"2xJungle Key: 1.05M -> 287K => -768K(1)"`
-///   `"128xWorm Membrane: 7.16M -> 7.91M => 741K(7)"`
-///
-/// Returns `(item_name, profit, flip_count)`.
-fn parse_bz_list_flip_detail(line: &str) -> Option<(String, i64, u32)> {
-    // Amount prefix: digits before 'x'
-    let x_idx = line.find('x')?;
-    let amount_str = line[..x_idx].trim();
-    if amount_str.is_empty() || !amount_str.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let rest = &line[x_idx + 1..];
-    let colon_idx = rest.find(':')?;
-    let item_name = rest[..colon_idx].trim().to_string();
-    if item_name.is_empty() {
-        return None;
-    }
-
-    // Profit: between "=> " and "("
-    let arrow_idx = rest.find("=> ")?;
-    let after_arrow = &rest[arrow_idx + 3..];
-    let paren_idx = after_arrow.find('(')?;
-    let profit_str = after_arrow[..paren_idx].trim();
-    let profit = parse_short_number(profit_str)?;
-
-    // Flip count: between "(" and ")"
-    let after_paren = &after_arrow[paren_idx + 1..];
-    let close_paren = after_paren.find(')')?;
-    let count: u32 = after_paren[..close_paren].trim().parse().ok()?;
-
-    Some((item_name, profit, count))
-}
-
-/// Parse a Coflnet `/cofl bz h` response and return the total profit in coins.
-///
-/// Expected format (color-stripped):
-///   `"Bazaar Profit History for <ign> (last <days> days)"`
-///   `"Total Profit: -234M"`
-///   `"Average Daily Profit: -33.5M"`
-///   …
-///
-/// We look for `"Total Profit: "` and parse the short-number value after it.
-fn parse_cofl_bz_h_total_profit(clean_msg: &str) -> Option<i64> {
-    let prefix = "Total Profit: ";
-    let idx = clean_msg.find(prefix)?;
-    let after = &clean_msg[idx + prefix.len()..];
-    // Take until the next whitespace or end of string.
-    let value_str: String = after.chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
-    parse_short_number(&value_str)
 }
 
 fn should_enqueue_periodic_auction_claim(
@@ -2765,7 +2622,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_cofl_bz_h_total_profit, parse_short_number, parse_bz_list_flip_detail, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
+    use super::{is_ban_disconnect, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
     use frikadellen_baf::types::{BotState, CommandType};
 
     #[test]
@@ -2831,91 +2688,5 @@ mod tests {
             &CommandType::ManageOrders { cancel_open: true },
             paused,
         ));
-    }
-
-    #[test]
-    fn parse_cofl_profit_response_82m() {
-        let msg = "According to our data TestUser made 82.7M in the last 0.05 days across 6 auctions";
-        assert_eq!(parse_cofl_profit_response(msg), Some(82_700_000));
-    }
-
-    #[test]
-    fn parse_cofl_profit_response_1b() {
-        let msg = "According to our data Player123 made 1.5B in the last 2.3 days across 142 auctions";
-        assert_eq!(parse_cofl_profit_response(msg), Some(1_500_000_000));
-    }
-
-    #[test]
-    fn parse_cofl_profit_response_plain() {
-        let msg = "According to our data SomeIGN made 500 in the last 0.01 days across 1 auctions";
-        assert_eq!(parse_cofl_profit_response(msg), Some(500));
-    }
-
-    #[test]
-    fn parse_cofl_profit_response_250k() {
-        let msg = "According to our data IGN made 250K in the last 0.1 days across 3 auctions";
-        assert_eq!(parse_cofl_profit_response(msg), Some(250_000));
-    }
-
-    #[test]
-    fn parse_cofl_profit_response_no_match() {
-        assert_eq!(parse_cofl_profit_response("Some random chat message"), None);
-    }
-
-    #[test]
-    fn parse_short_number_values() {
-        assert_eq!(parse_short_number("82.7M"), Some(82_700_000));
-        assert_eq!(parse_short_number("1.5B"), Some(1_500_000_000));
-        assert_eq!(parse_short_number("250K"), Some(250_000));
-        assert_eq!(parse_short_number("500"), Some(500));
-        assert_eq!(parse_short_number("1,500,000"), Some(1_500_000));
-        assert_eq!(parse_short_number("abc"), None);
-    }
-
-    #[test]
-    fn parse_bz_list_flip_detail_profit() {
-        let line = "2xJungle Key: 1.05M -> 287K => -768K(1)";
-        let (name, profit, count) = parse_bz_list_flip_detail(line).unwrap();
-        assert_eq!(name, "Jungle Key");
-        assert_eq!(profit, -768_000);
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn parse_bz_list_flip_detail_multiple_flips() {
-        let line = "128xWorm Membrane: 7.16M -> 7.91M => 741K(7)";
-        let (name, profit, count) = parse_bz_list_flip_detail(line).unwrap();
-        assert_eq!(name, "Worm Membrane");
-        assert_eq!(profit, 741_000);
-        assert_eq!(count, 7);
-    }
-
-    #[test]
-    fn parse_bz_list_flip_detail_no_match() {
-        assert!(parse_bz_list_flip_detail("Some random text").is_none());
-        assert!(parse_bz_list_flip_detail("Last Completed Bazaar Flips").is_none());
-    }
-
-    #[test]
-    fn parse_cofl_bz_h_negative_profit() {
-        let msg = "Total Profit: -234M";
-        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(-234_000_000));
-    }
-
-    #[test]
-    fn parse_cofl_bz_h_positive_profit() {
-        let msg = "Total Profit: 1.5B";
-        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(1_500_000_000));
-    }
-
-    #[test]
-    fn parse_cofl_bz_h_in_context() {
-        let msg = "Bazaar Profit History for TestUser (last 1 days)\nTotal Profit: -234M\nAverage Daily Profit: -33.5M";
-        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(-234_000_000));
-    }
-
-    #[test]
-    fn parse_cofl_bz_h_no_match() {
-        assert_eq!(parse_cofl_bz_h_total_profit("Some random message"), None);
     }
 }
