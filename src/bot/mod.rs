@@ -1,5 +1,5 @@
-mod client;
-mod handlers;
+pub(crate) mod client;
+pub(crate) mod handlers;
 pub mod state;
 
 pub use client::{BotClient, BotEvent};

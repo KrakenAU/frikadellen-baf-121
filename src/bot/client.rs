@@ -49,25 +49,25 @@ const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
 const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
-const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
+pub(crate) const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 /// Brief delay after closing a stale window so Hypixel processes the
 /// container-close packet before the next command is sent.
-const WINDOW_CLOSE_DELAY_MS: u64 = 150;
+pub(crate) const WINDOW_CLOSE_DELAY_MS: u64 = 150;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// Delay before retrying the auction flow after closing a window to remove a
 /// stuck item from the auction slot.  Gives Hypixel time to process the
 /// container-close packet and return the item to inventory.
-const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 2000;
+pub(crate) const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 2000;
 /// Maximum number of retry attempts when "You already have an item in the auction
 /// slot!" keeps recurring.  After this many retries the bot gives up and goes Idle
 /// instead of looping indefinitely and risking a "Sending packets too fast!" kick.
-const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
+pub(crate) const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
 /// Fallback slot index for "Manage Orders" in the Bazaar GUI when dynamic name
 /// lookup fails.  Hypixel's default layout places it at slot 50.
-const MANAGE_ORDERS_FALLBACK_SLOT: usize = 50;
+pub(crate) const MANAGE_ORDERS_FALLBACK_SLOT: usize = 50;
 /// Fallback slot index for "Sell Inventory Now" in the Bazaar GUI when dynamic
 /// name lookup fails.  Hypixel's default layout places it at slot 47.
-const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
+pub(crate) const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
 /// Debounce interval for `rebuild_cached_window_json` on `ContainerSetSlot` events.
 /// Individual slot updates are coalesced within this window to avoid excessive CPU
 /// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
@@ -81,16 +81,16 @@ const INVENTORY_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
 /// `wait_for_cancel_confirmation` to consider an action unprocessed.
 /// Raised from 5 → 8 to accommodate Hypixel server lag that caused
 /// frequent false "not confirmed" warnings and skipped events.
-const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 8;
+pub(crate) const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 8;
 /// Maximum number of cancel attempts per order before giving up.
 /// After this many failed cancel clicks in Order options, the order is skipped
 /// so the bot doesn't get stuck retrying indefinitely.
-const MAX_CANCEL_RETRIES: u32 = 5;
+pub(crate) const MAX_CANCEL_RETRIES: u32 = 5;
 /// Minimum number of empty player-inventory slots required to consider the
 /// inventory "not full".  Used when verifying the `inventory_full` flag
 /// against actual slot counts so stale flags are auto-cleared after a manual
 /// instasell or any other action that frees space.
-const MIN_FREE_SLOTS_FOR_BUY: u8 = 2;
+pub(crate) const MIN_FREE_SLOTS_FOR_BUY: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Window handler implementations — one fn per BotState variant.
@@ -3117,7 +3117,7 @@ impl BotClientState {
     /// Mirrors BotClient::get_purse() for use within window/sign handlers.
     /// Uses team prefix+suffix display text (same as get_scoreboard_lines()) because
     /// Hypixel SkyBlock stores sidebar text in teams, not in the score display field.
-    fn get_purse(&self) -> Option<u64> {
+    pub(crate) fn get_purse(&self) -> Option<u64> {
         let sidebar = self.sidebar_objective.read().clone()?;
         let scores = self.scoreboard_scores.read();
         let objective = scores.get(&sidebar)?;
@@ -3151,7 +3151,7 @@ impl BotClientState {
 }
 
 /// Remove Minecraft §-prefixed color/format codes from a string
-fn remove_mc_colors(s: &str) -> String {
+pub(crate) fn remove_mc_colors(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -3167,7 +3167,7 @@ fn remove_mc_colors(s: &str) -> String {
 /// Get the display name of an item slot as a plain string (no color codes).
 /// Checks `minecraft:custom_name` first (custom-named items), then falls back
 /// to `minecraft:item_name` (base item name override used by some Hypixel GUI items).
-fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
+pub(crate) fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
     if let Some(item_data) = item.as_present() {
         if let Ok(value) = serde_json::to_value(item_data) {
             let components = value.get("components");
@@ -3209,7 +3209,7 @@ fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option
 /// Get the display name of an item slot preserving §-color codes for rarity display.
 /// Same logic as `get_item_display_name_from_slot` but uses `extract_text_with_colors`
 /// so the web panel can render the name in the item's rarity color.
-fn get_item_display_name_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
+pub(crate) fn get_item_display_name_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
     if let Some(item_data) = item.as_present() {
         if let Ok(value) = serde_json::to_value(item_data) {
             let components = value.get("components");
@@ -3245,7 +3245,7 @@ fn get_item_display_name_with_colors_from_slot(item: &azalea_inventory::ItemStac
 }
 
 /// Recursively extract plain text from an Azalea/Minecraft chat component
-fn extract_text_from_chat_component(val: &serde_json::Value) -> String {
+pub(crate) fn extract_text_from_chat_component(val: &serde_json::Value) -> String {
     let mut result = String::new();
     if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
         result.push_str(text);
@@ -3260,7 +3260,7 @@ fn extract_text_from_chat_component(val: &serde_json::Value) -> String {
 
 /// Recursively extract text from a Minecraft chat component, preserving §-color codes.
 /// Converts JSON `"color"` fields back to § codes so the web UI can render them.
-fn extract_text_with_colors(val: &serde_json::Value) -> String {
+pub(crate) fn extract_text_with_colors(val: &serde_json::Value) -> String {
     let mut result = String::new();
     // Emit color/format codes from the component's properties
     if let Some(color) = val.get("color").and_then(|v| v.as_str()) {
@@ -3295,7 +3295,7 @@ fn extract_text_with_colors(val: &serde_json::Value) -> String {
 }
 
 /// Get lore lines from an item slot as plain strings (no color codes)
-fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
+pub(crate) fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
     let mut lore_lines = Vec::new();
     if let Some(item_data) = item.as_present() {
         if let Ok(value) = serde_json::to_value(item_data) {
@@ -3325,7 +3325,7 @@ fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
 
 /// Get lore lines from an item slot preserving Minecraft §-color codes.
 /// Used by the web panel to render colorful lore tooltips.
-fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
+pub(crate) fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
     let mut lore_lines = Vec::new();
     if let Some(item_data) = item.as_present() {
         if let Ok(value) = serde_json::to_value(item_data) {
@@ -3357,7 +3357,7 @@ fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Ve
 /// Uses integer arithmetic (tenths) to avoid floating-point subtraction issues.
 /// Commas are inserted into the integer part: 7500000.0 → "7,500,000",
 /// 2040950.5 → "2,040,950.5".
-fn format_price_for_sign(price: f64) -> String {
+pub(crate) fn format_price_for_sign(price: f64) -> String {
     // Work in tenths-of-a-coin as an integer to avoid floating-point precision
     // issues when splitting integer and fractional parts of large prices.
     let tenths = (price * 10.0).round() as i64;
@@ -3374,7 +3374,7 @@ fn format_price_for_sign(price: f64) -> String {
 
 /// Insert commas as thousands separators into an integer.
 /// Handles negative numbers correctly: -1234567 → "-1,234,567".
-fn format_with_commas(n: i64) -> String {
+pub(crate) fn format_with_commas(n: i64) -> String {
     let is_negative = n < 0;
     let s = n.unsigned_abs().to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
@@ -3393,7 +3393,7 @@ fn format_with_commas(n: i64) -> String {
 /// Normalize a string for fuzzy item-name matching: lowercase, strip Minecraft
 /// color codes, replace hyphens/underscores with spaces, remove common decorative
 /// Unicode symbols, and collapse consecutive whitespace.
-fn normalize_for_matching(s: &str) -> String {
+pub(crate) fn normalize_for_matching(s: &str) -> String {
     remove_mc_colors(s)
         .to_lowercase()
         .replace(['-', '_'], " ")
@@ -3403,7 +3403,7 @@ fn normalize_for_matching(s: &str) -> String {
         .join(" ")
 }
 
-fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Option<usize> {
+pub(crate) fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Option<usize> {
     let name_lower = name.to_lowercase();
 
     // Phase 1: fast-path — original exact `contains` check (case-insensitive).
@@ -3445,13 +3445,13 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
     None
 }
 
-fn lore_contains_phrase(lore: &[String], needle: &str) -> bool {
+pub(crate) fn lore_contains_phrase(lore: &[String], needle: &str) -> bool {
     let needle_lower = needle.to_lowercase();
     lore.iter()
         .any(|line| remove_mc_colors(line).to_lowercase().contains(&needle_lower))
 }
 
-fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &str) -> Option<usize> {
+pub(crate) fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &str) -> Option<usize> {
     slots.iter().enumerate().find_map(|(i, item)| {
         let lore = get_item_lore_from_slot(item);
         lore_contains_phrase(&lore, needle).then_some(i)
@@ -3462,14 +3462,14 @@ fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &st
 /// slot 31 of the BIN Auction View.  Hypixel typically shows the time in the item's
 /// lore as a "M:SS" or "MM:SS" pattern (e.g. "0:45", "1:00").
 /// Returns `None` if no time can be extracted.
-fn parse_bed_remaining_secs(item: &azalea_inventory::ItemStack) -> Option<u64> {
+pub(crate) fn parse_bed_remaining_secs(item: &azalea_inventory::ItemStack) -> Option<u64> {
     let name = get_item_display_name_from_slot(item).unwrap_or_default();
     let lore = get_item_lore_from_slot(item);
     let all_text = std::iter::once(name).chain(lore).collect::<Vec<_>>().join(" ");
     parse_bed_remaining_secs_from_text(&all_text)
 }
 
-fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
+pub(crate) fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
     // Match "M:SS" or "MM:SS" — the first such pattern is the time remaining
     let mut chars = all_text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -3524,7 +3524,7 @@ fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
 
 /// Returns true if the item is a claimable (sold/ended/expired) auction slot.
 /// Matches TypeScript ingameMessageHandler claimableIndicators / activeIndicators.
-fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
+pub(crate) fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
     let lore = get_item_lore_from_slot(item);
     if lore.is_empty() {
         return false;
@@ -3543,18 +3543,18 @@ fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
     has_claimable && !is_active
 }
 
-fn is_my_auctions_window_title(window_title: &str) -> bool {
+pub(crate) fn is_my_auctions_window_title(window_title: &str) -> bool {
     window_title.contains("Manage Auctions") || window_title.contains("My Auctions")
 }
 
-fn is_bazaar_orders_window_title(window_title: &str) -> bool {
+pub(crate) fn is_bazaar_orders_window_title(window_title: &str) -> bool {
     let lower = window_title.to_lowercase();
     lower.contains("manage orders")
         || lower.contains("your orders")
         || lower.contains("bazaar orders")
 }
 
-fn starts_with_phrase_delimited(text: &str, phrase: &str) -> bool {
+pub(crate) fn starts_with_phrase_delimited(text: &str, phrase: &str) -> bool {
     if !text.starts_with(phrase) {
         return false;
     }
@@ -3564,7 +3564,7 @@ fn starts_with_phrase_delimited(text: &str, phrase: &str) -> bool {
     }
 }
 
-fn is_bazaar_order_entry_name(name: &str) -> bool {
+pub(crate) fn is_bazaar_order_entry_name(name: &str) -> bool {
     let lower = name.trim_start().to_lowercase();
     if starts_with_phrase_delimited(&lower, "buy order") {
         return true;
@@ -3583,7 +3583,7 @@ fn is_bazaar_order_entry_name(name: &str) -> bool {
     false
 }
 
-fn normalize_bazaar_order_text(text: &str) -> String {
+pub(crate) fn normalize_bazaar_order_text(text: &str) -> String {
     remove_mc_colors(text)
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -3593,7 +3593,7 @@ fn normalize_bazaar_order_text(text: &str) -> String {
 
 /// Parse a "[Bazaar] Your Buy Order/Sell Offer for X was filled!" notification.
 /// Returns `(item_name, is_buy_order)` or `None` if the message doesn't match.
-fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
+pub(crate) fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
     if !message.contains("[Bazaar]") || !message.contains("was filled") {
         return None;
     }
@@ -3618,7 +3618,7 @@ fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
 /// Uses the original display name (preserving Hypixel's casing) by stripping
 /// the BUY/SELL prefix.  Falls back to `order_identity` (lowercased) then
 /// `to_title_case` to ensure webhook/chat names look correct.
-fn clean_order_item_name(order_name: &str, order_identity: &Option<(bool, String)>) -> String {
+pub(crate) fn clean_order_item_name(order_name: &str, order_identity: &Option<(bool, String)>) -> String {
     // First try stripping prefix from the ORIGINAL display name (preserves case)
     let stripped = remove_mc_colors(order_name).trim().to_string();
     for prefix in ["BUY ", "SELL ", "Buy Order: ", "Sell Offer: "] {
@@ -3646,7 +3646,7 @@ fn clean_order_item_name(order_name: &str, order_identity: &Option<(bool, String
     stripped
 }
 
-fn parse_bazaar_order_identity_from_name(name: &str) -> Option<(bool, String)> {
+pub(crate) fn parse_bazaar_order_identity_from_name(name: &str) -> Option<(bool, String)> {
     let normalized = normalize_bazaar_order_text(name);
     if let Some(item) = normalized.strip_prefix("buy order: ") {
         return Some((true, item.trim().to_string()));
@@ -3667,7 +3667,7 @@ fn parse_bazaar_order_identity_from_name(name: &str) -> Option<(bool, String)> {
     None
 }
 
-fn parse_bazaar_order_identity_from_lore(lore: &[String]) -> Option<(bool, String)> {
+pub(crate) fn parse_bazaar_order_identity_from_lore(lore: &[String]) -> Option<(bool, String)> {
     let mut side: Option<bool> = None;
     let mut item_name: Option<String> = None;
 
@@ -3699,13 +3699,13 @@ fn parse_bazaar_order_identity_from_lore(lore: &[String]) -> Option<(bool, Strin
     }
 }
 
-fn is_buy_bazaar_order_name(name: &str) -> bool {
+pub(crate) fn is_buy_bazaar_order_name(name: &str) -> bool {
     let lower = name.trim_start().to_lowercase();
     starts_with_phrase_delimited(&lower, "buy order")
         || lower.starts_with("buy ")
 }
 
-fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
+pub(crate) fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
     // Prefer lore-based identity when available — it contains the *specific*
     // item name (e.g. "Blast Protection VII") while the display name may be
     // generic (e.g. "Enchanted Book").  Fall back to name-based parsing when
@@ -3714,7 +3714,7 @@ fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, Str
         .or_else(|| parse_bazaar_order_identity_from_name(name))
 }
 
-fn should_treat_as_bazaar_order_slot(name: &str, identity: Option<&(bool, String)>) -> bool {
+pub(crate) fn should_treat_as_bazaar_order_slot(name: &str, identity: Option<&(bool, String)>) -> bool {
     is_bazaar_order_entry_name(name) || identity.is_some()
 }
 
@@ -3726,7 +3726,7 @@ fn should_treat_as_bazaar_order_slot(name: &str, identity: Option<&(bool, String
 ///
 /// We intentionally check for *any* claimable indicator so that both fully
 /// and partially filled orders are considered for collection.
-fn is_order_claimable_from_lore(lore: &[String]) -> bool {
+pub(crate) fn is_order_claimable_from_lore(lore: &[String]) -> bool {
     for line in lore {
         let clean = remove_mc_colors(line).to_lowercase();
         // "Filled: 64/64 100%!" — fully filled
@@ -3751,7 +3751,7 @@ fn is_order_claimable_from_lore(lore: &[String]) -> bool {
 /// Returns `Some((filled, total))` when found.  Used to determine the actual
 /// quantity claimed (not the original order amount) so buy-cost recording and
 /// profit calculations are accurate for partial fills.
-fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
+pub(crate) fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
     for line in lore {
         let clean = remove_mc_colors(line);
         // Expected format: "Filled: 32/64 50%"
@@ -3777,7 +3777,7 @@ fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
 
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
 /// and should be aborted immediately instead of waiting for the GUI watchdog timeout.
-fn is_terminal_purchase_failure_message(message: &str) -> bool {
+pub(crate) fn is_terminal_purchase_failure_message(message: &str) -> bool {
     message.contains("You didn't participate in this auction!")
         || message.contains("This auction wasn't found!")
         || message.contains("The auction wasn't found!")
@@ -5034,37 +5034,37 @@ async fn handle_window_interaction(
     
     match bot_state {
         BotState::Purchasing => {
-            handle_window_purchasing(bot, state, window_id, window_title).await;
+            crate::auction::handle_window_purchasing(bot, state, window_id, window_title).await;
         }
         BotState::Bazaar => {
-            handle_window_bazaar(bot, state, window_id, window_title).await;
+            crate::bazaar::handle_window_bazaar(bot, state, window_id, window_title).await;
         }
         BotState::InstaSelling => {
-            handle_window_insta_selling(bot, state, window_id, window_title).await;
+            crate::bazaar::handle_window_insta_selling(bot, state, window_id, window_title).await;
         }
         BotState::ClaimingPurchased => {
-            handle_window_claiming_purchased(bot, state, window_id, window_title).await;
+            crate::auction::handle_window_claiming_purchased(bot, state, window_id, window_title).await;
         }
         BotState::ClaimingSold => {
-            handle_window_claiming_sold(bot, state, window_id, window_title).await;
+            crate::auction::handle_window_claiming_sold(bot, state, window_id, window_title).await;
         }
         BotState::CancellingAuction => {
-            handle_window_cancelling_auction(bot, state, window_id, window_title).await;
+            crate::auction::handle_window_cancelling_auction(bot, state, window_id, window_title).await;
         }
         BotState::Selling => {
-            handle_window_selling(bot, state, window_id, window_title).await;
+            crate::auction::handle_window_selling(bot, state, window_id, window_title).await;
         }
         BotState::ManagingOrders => {
-            handle_window_managing_orders(bot, state, window_id, window_title).await;
+            crate::bazaar::handle_window_managing_orders(bot, state, window_id, window_title).await;
         }
         BotState::SellingInventoryBz => {
-            handle_window_selling_inventory_bz(bot, state, window_id, window_title).await;
+            crate::bazaar::handle_window_selling_inventory_bz(bot, state, window_id, window_title).await;
         }
         BotState::CheckingCookie => {
-            handle_window_checking_cookie(bot, state, window_id, window_title).await;
+            crate::auction::handle_window_checking_cookie(bot, state, window_id, window_title).await;
         }
         BotState::BuyingCookie => {
-            handle_window_buying_cookie(bot, state, window_id, window_title).await;
+            crate::auction::handle_window_buying_cookie(bot, state, window_id, window_title).await;
         }
         _ => {
             // Not in a state that requires window interaction
@@ -5074,7 +5074,7 @@ async fn handle_window_interaction(
 
 /// Parse a cookie duration string from lore text and return seconds.
 /// Handles "Duration: Xd Xh Xm" format (matching TypeScript parseCookieDuration).
-fn parse_cookie_duration_secs(lore_text: &str) -> u64 {
+pub(crate) fn parse_cookie_duration_secs(lore_text: &str) -> u64 {
     let clean = remove_mc_colors(lore_text);
     let mut total: u64 = 0;
     if let Some(m) = regex_first_u64(&clean, r"(\d+)d") { total += m * 86400; }
@@ -5084,7 +5084,7 @@ fn parse_cookie_duration_secs(lore_text: &str) -> u64 {
 }
 
 /// Helper: extract first captured u64 from a simple regex pattern (no deps on regex crate).
-fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
+pub(crate) fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
     // Simple manual parser for patterns like r"(\d+)d"
     // We only need to handle "Nd", "Nh", "Nm" patterns.
     let suffix = pattern.trim_start_matches(r"(\d+)");
@@ -5100,7 +5100,7 @@ fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
     None
 }
 
-fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Value {
+pub(crate) fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Value {
     match serde_json::to_value(&item_data.component_patch) {
         Ok(value) => {
             if value.as_object().map_or(false, |o| o.is_empty()) {
@@ -5141,7 +5141,7 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
 /// Extract individual item components that are known to serialize without errors.
 /// Used as a fallback when the full component_patch serialization fails (e.g., due to
 /// HashMap<Enchantment, i32> non-string map keys in enchanted items).
-fn extract_serializable_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Map<String, serde_json::Value> {
+pub(crate) fn extract_serializable_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Map<String, serde_json::Value> {
     use azalea_inventory::components::{CustomData, CustomName, Lore, Profile, TooltipDisplay};
     let mut obj = serde_json::Map::new();
 
@@ -5188,14 +5188,14 @@ fn extract_serializable_components(item_data: &azalea_inventory::ItemStackData) 
     obj
 }
 
-fn should_suppress_component_patch_serialization_warning(error: &serde_json::Error) -> bool {
+pub(crate) fn should_suppress_component_patch_serialization_warning(error: &serde_json::Error) -> bool {
     error.to_string().contains("key must be a string")
 }
 
 /// Extract the SkyBlock item tag (ExtraAttributes.id or direct id) from the CustomData component.
 /// This bypasses the full component_patch serialization and works even when that fails
 /// (e.g., due to enchantment HashMap key serialization issues).
-fn extract_skyblock_tag_from_custom_data(item_data: &azalea_inventory::ItemStackData) -> Option<String> {
+pub(crate) fn extract_skyblock_tag_from_custom_data(item_data: &azalea_inventory::ItemStackData) -> Option<String> {
     use azalea_inventory::components::CustomData;
     let custom_data = item_data.component_patch.get::<CustomData>()?;
     // Serialize just the CustomData.nbt compound to JSON and extract the id
@@ -5213,7 +5213,7 @@ fn extract_skyblock_tag_from_custom_data(item_data: &azalea_inventory::ItemStack
 /// Pets all share ExtraAttributes.id = "PET". The actual pet type (e.g. "MAMMOTH")
 /// is inside the petInfo JSON string at ExtraAttributes.petInfo or custom_data.petInfo.
 /// Returns e.g. "PET_MAMMOTH" for Coflnet icon lookup, or the original tag unchanged.
-fn resolve_pet_tag(tag: &str, nbt_data: &serde_json::Value) -> String {
+pub(crate) fn resolve_pet_tag(tag: &str, nbt_data: &serde_json::Value) -> String {
     if tag != "PET" {
         return tag.to_string();
     }
@@ -5245,7 +5245,7 @@ fn resolve_pet_tag(tag: &str, nbt_data: &serde_json::Value) -> String {
 /// Called after every ContainerSetContent / ContainerSetSlot so that
 /// `BotClient::get_cached_inventory_json()` always returns fresh data.
 /// The serialised format matches TypeScript `JSON.stringify(bot.inventory)`.
-fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
+pub(crate) fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     let menu = bot.menu();
     let all_slots = menu.slots();
     let player_range = menu.player_slots_range();
@@ -5407,7 +5407,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
 ///   - ContainerSetContent (window contents fully replaced)
 ///   - ContainerSetSlot (individual slot updated in current window)
 ///   - ContainerClose (window closed → clear the cache)
-fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
+pub(crate) fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
     let window_title = state.handlers.current_window_title();
     let window_id_opt = state.handlers.current_window_id();
     let bot_state = format!("{:?}", *state.bot_state.read());
@@ -5519,7 +5519,7 @@ fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
 /// - Lore: contains bid/price info, time remaining, and status
 ///
 /// We extract the item name, lore, tag, and parse bid/time/status from lore.
-fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &BotClientState) {
+pub(crate) fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &BotClientState) {
     let mut auctions: Vec<serde_json::Value> = Vec::new();
 
     // Auction slots are typically in the first rows of the chest (slots 0-53).
@@ -5631,7 +5631,7 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
 /// Extract a price value from lore lines.
 /// Looks for patterns like "Buy It Now: 1,234,567 coins" or "Starting bid: 100 coins"
 /// or "Top bid: 5,000 coins"
-fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
+pub(crate) fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
     for line in lore {
         let clean = remove_mc_colors(line).to_lowercase();
         // Match various price patterns
@@ -5652,7 +5652,7 @@ fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
 
 /// Extract time remaining from lore lines.
 /// Looks for patterns like "Ends in: 1d 2h 30m" or "Ends in: 45m 20s"
-fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
+pub(crate) fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
     static RE_DAYS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*d").unwrap());
     static RE_HOURS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*h").unwrap());
     static RE_MINS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*m(?:[^s]|$)").unwrap());
@@ -5691,7 +5691,7 @@ fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
     None
 }
 
-fn bazaar_order_log_path() -> std::path::PathBuf {
+pub(crate) fn bazaar_order_log_path() -> std::path::PathBuf {
     match std::env::current_exe() {
         Ok(exe) => exe.parent().map(|p| p.join("bazaar_orders.log"))
             .unwrap_or_else(|| std::path::PathBuf::from("bazaar_orders.log")),
@@ -5700,7 +5700,7 @@ fn bazaar_order_log_path() -> std::path::PathBuf {
 }
 
 /// Persist a placed bazaar order for later stale-order checks in ManageOrders.
-fn log_bazaar_order_placed(is_buy: bool, item_name: &str, total_value: f64) {
+pub(crate) fn log_bazaar_order_placed(is_buy: bool, item_name: &str, total_value: f64) {
     use std::io::Write;
     let side = if is_buy { "buy" } else { "sell" };
     let normalized_item = normalize_bazaar_order_text(item_name);
@@ -5721,7 +5721,7 @@ fn log_bazaar_order_placed(is_buy: bool, item_name: &str, total_value: f64) {
 
 /// Returns (timestamp, total_value_coins) for the most recent matching logged order.
 /// Old log entries without a value field default to 1_000_000.0 (1M coins) for backward compat.
-fn last_logged_order_info(is_buy: bool, item_name: &str) -> Option<(i64, f64)> {
+pub(crate) fn last_logged_order_info(is_buy: bool, item_name: &str) -> Option<(i64, f64)> {
     let target_side = if is_buy { "buy" } else { "sell" };
     let target_item = normalize_bazaar_order_text(item_name);
     if target_item.is_empty() {
@@ -5748,7 +5748,7 @@ fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
     last_logged_order_info(is_buy, item_name).map(|(ts, _)| ts)
 }
 
-fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, cancel_minutes_per_million: u64) -> bool {
+pub(crate) fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, cancel_minutes_per_million: u64) -> bool {
     if cancel_minutes_per_million == 0 {
         return false;
     }
@@ -5780,7 +5780,7 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
 /// Append an unclaimed bazaar order to `pending_claims.log` with an RFC 3339 timestamp.
 /// Called when inventory is full and a filled order cannot be collected.
 /// The log can be reviewed later to know which orders need manual collection.
-fn log_pending_claim(order_name: &str) {
+pub(crate) fn log_pending_claim(order_name: &str) {
     use std::io::Write;
     let timestamp = chrono::Utc::now().to_rfc3339();
     let line = format!("{} {}\n", timestamp, order_name);
@@ -5798,7 +5798,7 @@ fn log_pending_claim(order_name: &str) {
 
 /// Count the number of empty (air) slots in the player's inventory (36 slots).
 /// Used to verify whether inventory is actually full before skipping BUY orders.
-fn count_empty_player_slots(bot: &Client) -> usize {
+pub(crate) fn count_empty_player_slots(bot: &Client) -> usize {
     let menu = bot.menu();
     let all_slots = menu.slots();
     let player_range = menu.player_slots_range();
@@ -5810,7 +5810,7 @@ fn count_empty_player_slots(bot: &Client) -> usize {
 /// inventory slots (> half of 36 = 18 slots). Used to detect a dominant stackable item
 /// that should be instasold to free space when inventory is full.
 /// Returns None if no single item type dominates the inventory.
-fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
+pub(crate) fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
     let menu = bot.menu();
     let all_slots = menu.slots();
     let player_range = menu.player_slots_range();
@@ -5839,7 +5839,7 @@ fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
 /// queued the click *behind* an `apply_deferred` boundary, while
 /// `send_raw_close` wrote directly to TCP — causing the close to reach the
 /// server before the click, silently discarding Claim All / Collect actions.
-async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, window_id: u8, slot: i16) {
+pub(crate) async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, window_id: u8, slot: i16) {
     // Window 0 is the player's own inventory — always valid, no container guard.
     // For all GUI containers, refuse to click if a newer window has replaced this one;
     // clicking a closed/stale container is physically impossible for a real player and
@@ -5859,7 +5859,7 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
 ///
 /// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
 /// The function strips it before putting the command string into the packet.
-fn send_chat_command(bot: &Client, content: &str) {
+pub(crate) fn send_chat_command(bot: &Client, content: &str) {
     let command = content.strip_prefix('/').unwrap_or_else(|| {
         debug!("send_chat_command called without leading '/' — sending as-is: {}", content);
         content
@@ -5880,7 +5880,7 @@ fn send_chat_command(bot: &Client, content: &str) {
 /// and confirm clicks on the auction purchase path.
 ///
 /// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
-fn send_raw_chat_command(bot: &Client, content: &str) {
+pub(crate) fn send_raw_chat_command(bot: &Client, content: &str) {
     let command = content.strip_prefix('/').unwrap_or_else(|| {
         debug!("send_raw_chat_command called without leading '/' — sending as-is: {}", content);
         content
@@ -5900,7 +5900,7 @@ fn send_raw_chat_command(bot: &Client, content: &str) {
 ///
 /// Used for time-critical slot clicks (buy button, confirm button) on the
 /// auction purchase path where every millisecond matters.
-fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
+pub(crate) fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
     use azalea_protocol::packets::game::s_container_click::{
         ServerboundContainerClick,
         HashedStack,
@@ -5939,7 +5939,7 @@ fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
 /// fire on the next command.  Clearing eagerly is harmless: if the server
 /// does send `ClientboundContainerClose`, the `ContainerClose` handler
 /// re-clears the already-`None` fields.
-fn send_raw_close(bot: &Client, window_id: u8, handlers: &BotEventHandlers) {
+pub(crate) fn send_raw_close(bot: &Client, window_id: u8, handlers: &BotEventHandlers) {
     bot.with_raw_connection_mut(|mut raw_conn| {
         if let Err(e) = raw_conn.write(ServerboundContainerClose {
             container_id: window_id as i32,
@@ -5955,7 +5955,7 @@ fn send_raw_close(bot: &Client, window_id: u8, handlers: &BotEventHandlers) {
 /// confirmation that the server processed the cancellation.  Returns `true` when
 /// the Cancel button disappears from the window (or the window itself changes),
 /// `false` on timeout (meaning the cancel click was likely not processed).
-async fn wait_for_cancel_confirmation(
+pub(crate) async fn wait_for_cancel_confirmation(
     bot: &Client,
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
@@ -5982,7 +5982,7 @@ async fn wait_for_cancel_confirmation(
 /// confirmation that the server processed the collection.  Returns `true` when
 /// the Collect button disappears from the window (or the window itself changes),
 /// `false` on timeout (meaning the collect click was likely not processed).
-async fn wait_for_collect_confirmation(
+pub(crate) async fn wait_for_collect_confirmation(
     bot: &Client,
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
@@ -6010,7 +6010,7 @@ async fn wait_for_collect_confirmation(
 /// Check the internal ManageOrders deadline.  If exceeded, close the current window
 /// and return the bot to Idle so the command queue isn't blocked for the full 60-second
 /// external timeout.  Returns `true` when the deadline was hit (caller should `return`).
-fn check_manage_orders_deadline(
+pub(crate) fn check_manage_orders_deadline(
     bot: &Client,
     state: &BotClientState,
     window_id: u8,
@@ -6044,7 +6044,7 @@ fn check_manage_orders_deadline(
 /// chat command gives the server time to process the ContainerClose before the
 /// new /bz command arrives, and avoids "Sending packets too fast!" kicks.
 /// Raised from 500 → 800 ms to reduce kick frequency under heavy GUI cycling.
-async fn close_window_and_reopen_bz(
+pub(crate) async fn close_window_and_reopen_bz(
     bot: &Client,
     state: &BotClientState,
     window_id: u8,
@@ -6064,7 +6064,7 @@ async fn close_window_and_reopen_bz(
 ///
 /// Glass panes and other GUI filler/decoration items are ignored — Hypixel uses
 /// them as placeholder visuals and clicking them is a no-op that wastes time.
-async fn clear_auction_preview_slot(
+pub(crate) async fn clear_auction_preview_slot(
     bot: &Client,
     state: &BotClientState,
     window_id: u8,
@@ -6089,7 +6089,7 @@ async fn clear_auction_preview_slot(
 ///
 /// Uses raw TCP (matching `click_window_slot` and `send_raw_close`) so that
 /// click → close ordering is preserved on the wire.
-async fn click_window_slot_carrying(
+pub(crate) async fn click_window_slot_carrying(
     bot: &Client,
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
@@ -6263,7 +6263,7 @@ async fn run_startup_workflow(
 }
 
 /// Parse "You purchased <item> for <price> coins!" → (item_name, price)
-fn parse_purchased_message(msg: &str) -> Option<(String, u64)> {
+pub(crate) fn parse_purchased_message(msg: &str) -> Option<(String, u64)> {
     // "You purchased <item> for <price> coins!"
     let after = msg.strip_prefix("You purchased ")?;
     let for_idx = after.rfind(" for ")?;
@@ -6276,7 +6276,7 @@ fn parse_purchased_message(msg: &str) -> Option<(String, u64)> {
 }
 
 /// Parse "[Auction] <buyer> bought <item> for <price> coins" → (buyer, item_name, price)
-fn parse_sold_message(msg: &str) -> Option<(String, String, u64)> {
+pub(crate) fn parse_sold_message(msg: &str) -> Option<(String, String, u64)> {
     // "[Auction] <buyer> bought <item> for <price> coins"
     let after = msg.strip_prefix("[Auction] ")?;
     let bought_idx = after.find(" bought ")?;
@@ -6322,7 +6322,7 @@ fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Optio
 /// (UUID ends at `"` after the value string, e.g. from a serialized clickEvent).
 /// Minecraft UUIDs consist only of hex digits and dashes, so `"` is never a valid
 /// UUID character — using it as a terminator is unconditionally safe.
-fn extract_viewauction_uuid(msg: &str) -> Option<String> {
+pub(crate) fn extract_viewauction_uuid(msg: &str) -> Option<String> {
     let idx = msg.find("/viewauction ")?;
     let rest = &msg[idx + 13..];
     let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
