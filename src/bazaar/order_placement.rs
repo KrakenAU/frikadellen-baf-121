@@ -1,49 +1,17 @@
 use azalea::prelude::*;
-use azalea_protocol::packets::game::s_sign_update::ServerboundSignUpdate;
-use azalea_protocol::packets::game::s_container_close::ServerboundContainerClose;
-use parking_lot::RwLock;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::{info, error, debug, warn};
+use tracing::{info, debug, warn};
 use crate::types::BotState;
 use crate::bot::client::{
     BotClientState, BotEvent,
     // step enums
-    BazaarStep, InstaSellStep, SellInventoryStep, AuctionStep, CookieStep,
+    BazaarStep,
     // utility fns (pub(crate) in client.rs)
-    click_window_slot, send_chat_command, send_raw_chat_command,
-    send_raw_close, send_raw_click,
-    find_slot_by_name, find_slot_by_lore_contains,
-    get_item_display_name_from_slot, get_item_lore_from_slot,
-    remove_mc_colors, lore_contains_phrase,
-    format_price_for_sign,
-    is_bazaar_orders_window_title, is_my_auctions_window_title,
-    is_order_claimable_from_lore, is_claimable_auction_slot,
-    parse_bazaar_filled_notification, parse_filled_amount_from_lore,
-    parse_bazaar_order_identity, parse_bazaar_order_identity_from_name,
-    is_bazaar_order_entry_name, is_buy_bazaar_order_name,
-    should_treat_as_bazaar_order_slot, clean_order_item_name,
-    log_bazaar_order_placed, should_cancel_open_order_due_to_age,
-    log_pending_claim, check_manage_orders_deadline,
-    close_window_and_reopen_bz,
-    wait_for_cancel_confirmation, wait_for_collect_confirmation,
-    is_terminal_purchase_failure_message,
-    parse_bed_remaining_secs,
-    parse_cookie_duration_secs,
-    clear_auction_preview_slot, click_window_slot_carrying,
-    count_empty_player_slots, find_dominant_inventory_item,
-    build_cached_my_auctions_json, rebuild_cached_window_json,
-    MANAGE_ORDERS_FALLBACK_SLOT, SELL_INVENTORY_NOW_FALLBACK_SLOT,
-    MAX_CANCEL_RETRIES, MIN_FREE_SLOTS_FOR_BUY,
-    WINDOW_CLOSE_DELAY_MS,
-};
-use azalea_protocol::packets::game::s_set_carried_item::ServerboundSetCarriedItem;
-use azalea_protocol::packets::game::s_use_item::ServerboundUseItem;
-use azalea_protocol::packets::game::s_interact::InteractionHand;
-use crate::bot::client::{
-    normalize_bazaar_order_text,
-    extract_price_from_lore,
-    CONFIRM_PURCHASE_RETRY_MS,
+    click_window_slot,
+    send_raw_close,
+    find_slot_by_name,
+    get_item_display_name_from_slot,
+    log_bazaar_order_placed,
 };
 
 

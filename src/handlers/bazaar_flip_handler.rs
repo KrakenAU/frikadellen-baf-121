@@ -30,7 +30,6 @@ const MAX_LOGGED_SLOTS: usize = 15;
 const MINEFLAYER_WINDOW_PROCESS_DELAY_MS: u64 = 300;
 #[allow(dead_code)]
 const BAZAAR_RETRY_DELAY_MS: u64 = 2000;
-const FIRST_SEARCH_RESULT_SLOT: usize = 11;
 
 /// Price failsafe thresholds
 #[allow(dead_code)]
