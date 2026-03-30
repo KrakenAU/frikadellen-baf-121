@@ -14,12 +14,10 @@ use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::gui::{WindowHandler, WindowSlot};
-use crate::types::{BazaarFlipRecommendation, BotState};
-use crate::utils::to_title_case;
+use crate::types::BazaarFlipRecommendation;
 
 /// Configuration constants
 #[allow(dead_code)]
@@ -32,9 +30,6 @@ const MAX_LOGGED_SLOTS: usize = 15;
 const MINEFLAYER_WINDOW_PROCESS_DELAY_MS: u64 = 300;
 #[allow(dead_code)]
 const BAZAAR_RETRY_DELAY_MS: u64 = 2000;
-const MAX_ORDER_PLACEMENT_RETRIES: usize = 3;
-const RETRY_BACKOFF_BASE_MS: u64 = 1000;
-#[allow(dead_code)]
 const FIRST_SEARCH_RESULT_SLOT: usize = 11;
 
 /// Price failsafe thresholds
@@ -73,18 +68,6 @@ impl Default for BazaarFlipConfig {
             max_sell_orders: 10,
         }
     }
-}
-
-/// Bazaar order step in the placement flow
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-enum BazaarStep {
-    Initial,
-    SearchResults,
-    SelectOrderType,
-    SetAmount,
-    SetPrice,
-    Confirm,
 }
 
 /// Bazaar flip handler state
@@ -324,163 +307,6 @@ impl BazaarFlipHandler {
             is_buy_order,
             is_sell: None,
         }))
-    }
-
-    /// Handle a bazaar flip recommendation
-    /// 
-    /// This is the main entry point for processing bazaar flips.
-    pub async fn handle_bazaar_flip_recommendation<F>(
-        &self,
-        recommendation: BazaarFlipRecommendation,
-        bot_state: Arc<RwLock<BotState>>,
-        send_command: F,
-    ) -> Result<()>
-    where
-        F: Fn(&str) -> Result<()>,
-    {
-        // Check if bazaar flips are enabled
-        if !self.is_enabled() {
-            warn!("Bazaar flips are disabled in config");
-            return Ok(());
-        }
-
-        // Check if bot is in startup state
-        if *bot_state.read() == BotState::Startup {
-            info!("Ignoring bazaar flip during startup phase");
-            return Ok(());
-        }
-
-        let order_type = if recommendation.is_buy_order { "BUY" } else { "SELL" };
-        info!(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n{} ORDER - {}\nAmount: {}x\nPrice/unit: {} coins\nTotal: {} coins\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            order_type,
-            recommendation.item_name,
-            recommendation.amount,
-            recommendation.price_per_unit,
-            recommendation.calculate_total_price()
-        );
-
-        // Execute bazaar flip with retries
-        self.execute_bazaar_flip(recommendation, bot_state, send_command).await
-    }
-
-    /// Execute a bazaar flip operation
-    async fn execute_bazaar_flip<F>(
-        &self,
-        recommendation: BazaarFlipRecommendation,
-        bot_state: Arc<RwLock<BotState>>,
-        send_command: F,
-    ) -> Result<()>
-    where
-        F: Fn(&str) -> Result<()>,
-    {
-        let mut last_error: Option<anyhow::Error> = None;
-
-        for attempt in 1..=MAX_ORDER_PLACEMENT_RETRIES {
-            *bot_state.write() = BotState::Bazaar;
-
-            if attempt > 1 {
-                info!("Retry attempt {}/{} for {}", attempt, MAX_ORDER_PLACEMENT_RETRIES, recommendation.item_name);
-            }
-
-            match self.place_bazaar_order(&recommendation, &send_command).await {
-                Ok(()) => {
-                    info!("===== BAZAAR FLIP ORDER COMPLETED =====");
-                    info!("Successfully placed bazaar order!");
-                    *bot_state.write() = BotState::Idle;
-                    return Ok(());
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    let error_message = last_error.as_ref().unwrap().to_string();
-                    
-                    let is_timeout_error = error_message.contains("timed out");
-                    let is_retryable_error = is_timeout_error || error_message.contains("Price failsafe");
-                    
-                    error!("Error handling bazaar flip (attempt {}/{}): {}", attempt, MAX_ORDER_PLACEMENT_RETRIES, error_message);
-                    
-                    if attempt < MAX_ORDER_PLACEMENT_RETRIES && is_retryable_error {
-                        let backoff_delay = RETRY_BACKOFF_BASE_MS * 2_u64.pow(attempt as u32 - 1);
-                        info!("Will retry after {}ms delay...", backoff_delay);
-                        *bot_state.write() = BotState::Idle;
-                        sleep(Duration::from_millis(backoff_delay)).await;
-                    } else {
-                        if !is_retryable_error {
-                            error!("Non-retryable error, aborting: {}", error_message);
-                        } else {
-                            error!("Max retries ({}) reached, giving up", MAX_ORDER_PLACEMENT_RETRIES);
-                        }
-                        *bot_state.write() = BotState::Idle;
-                        return Err(last_error.unwrap());
-                    }
-                }
-            }
-        }
-
-        *bot_state.write() = BotState::Idle;
-        Err(last_error.unwrap_or_else(|| anyhow!("Order placement failed after all retries")))
-    }
-
-    /// Place a bazaar order by navigating through the Hypixel bazaar interface
-    /// 
-    /// Steps:
-    /// 1. Search results (if using item name instead of tag)
-    /// 2. Item detail view with Create Buy Order / Create Sell Offer
-    /// 3. Amount selection - buy orders only
-    /// 4. Price selection
-    /// 5. Confirmation
-    async fn place_bazaar_order<F>(
-        &self,
-        recommendation: &BazaarFlipRecommendation,
-        send_command: F,
-    ) -> Result<()>
-    where
-        F: Fn(&str) -> Result<()>,
-    {
-        info!(
-            "[BazaarFlow] Starting placeBazaarOrder for {} ({}x @ {} coins, {})",
-            recommendation.item_name,
-            recommendation.amount,
-            recommendation.price_per_unit,
-            if recommendation.is_buy_order { "BUY" } else { "SELL" }
-        );
-
-        // Prefer itemTag over itemName for /bz command
-        let search_term = recommendation
-            .item_tag
-            .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or_else(|| &recommendation.item_name);
-
-        let search_term_formatted = if recommendation.item_tag.is_some() {
-            search_term.to_string()
-        } else {
-            to_title_case(search_term)
-        };
-
-        if recommendation.item_tag.is_some() {
-            info!("Using itemTag \"{}\" for /bz command (faster, skips search results)", search_term_formatted);
-        } else {
-            info!("itemTag not available, using itemName \"{}\" for /bz command", search_term_formatted);
-        }
-
-        // Set up window listener (in actual implementation)
-        // For now, just send the command
-        info!("[BazaarFlow] Executing /bz {}", search_term_formatted);
-        let command = format!("/bz {}", search_term_formatted);
-        send_command(&command)?;
-
-        // TODO: Implement actual window handling with open_window event listener
-        // This would involve:
-        // 1. Listening for open_window packets
-        // 2. Parsing window title and slots
-        // 3. Clicking through the bazaar interface steps
-        // 4. Handling sign inputs for amount and price
-        // 5. Confirming the order
-        
-        info!("[BazaarFlow] Window handling not yet implemented - this is a skeleton");
-        
-        Ok(())
     }
 
     /// Find item in search results with exact match priority, then fuzzy fallback
