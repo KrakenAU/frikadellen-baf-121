@@ -1728,864 +1728,11 @@ async fn event_handler(
             // which fires reliably after the bot is authenticated and in the game.
         }
         
-        Event::Chat(chat) => {
-            // Filter out overlay messages (action bar - e.g., health/defense/mana stats)
-            let is_overlay = matches!(chat, ChatPacket::System(ref packet) if packet.overlay);
-            
-            if is_overlay {
-                // Skip overlay messages - they spam the logs with stats updates
-                return Ok(());
-            }
-            
-            let message = chat.message().to_string();
-            state.handlers.handle_chat_message(&message).await;
-            if state.event_tx.send(BotEvent::ChatMessage(message.clone())).is_err() {
-                debug!("Failed to send ChatMessage event - receiver dropped");
-            }
-
-            // Buffer the message for periodic chatBatch upload to Coflnet.
-            // Uses clean text (color codes stripped) matching the Coflnet mod protocol.
-            let clean_for_batch = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
-            if !clean_for_batch.trim().is_empty() {
-                state.chat_batch_buffer.write().push(clean_for_batch);
-            }
-
-            // Detect purchase/sold messages and emit events
-            let clean_message = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
-
-            if clean_message.contains("You purchased") && clean_message.contains("coins!") {
-                // "You purchased <item> for <price> coins!"
-                if let Some((item_name, price)) = parse_purchased_message(&clean_message) {
-                    // Include the buy speed measured from flip received to escrow message
-                    let buy_speed_ms = state.last_buy_speed_ms.write().take();
-                    let _ = state.event_tx.send(BotEvent::ItemPurchased { item_name, price, buy_speed_ms });
-                }
-            } else if clean_message.contains("Putting coins in escrow") {
-                // "Putting coins in escrow..." — purchase accepted by server.
-                // Calculate buy speed from when /viewauction was sent.
-                if let Some(start) = state.purchase_start_time.write().take() {
-                    let speed_ms = start.elapsed().as_millis() as u64;
-                    *state.last_buy_speed_ms.write() = Some(speed_ms);
-                    let _ = state.event_tx.send(BotEvent::ChatMessage(
-                        format!("§f[§4BAF§f]: §aAuction bought in {}ms", speed_ms)
-                    ));
-                    info!("[AH] Buy speed: {}ms", speed_ms);
-                }
-            } else if *state.bot_state.read() == BotState::Purchasing
-                && is_terminal_purchase_failure_message(&clean_message)
-            {
-                // Abort immediately on terminal purchase failure messages so we don't keep a
-                // stale purchasing window open for 5s and overlap the next queued command.
-                // Use write lock for atomic check-and-set to prevent a double-close race
-                // with the slot-31 non-buyable handler (both can fire concurrently when
-                // e.g. a potato + "You didn't participate" arrive at the same time).
-                let should_close = {
-                    let mut bs = state.bot_state.write();
-                    if *bs == BotState::Purchasing {
-                        *bs = BotState::Idle;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if should_close {
-                    let window_id = *state.last_window_id.read();
-                    warn!(
-                        "[AH] Terminal purchase failure detected: \"{}\" — closing window {}",
-                        clean_message, window_id
-                    );
-                    if window_id > 0 {
-                        send_raw_close(&bot, window_id, &state.handlers);
-                    }
-                    state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                    state.skip_click_sent.store(false, Ordering::Relaxed);
-                    *state.purchase_start_time.write() = None;
-                    *state.pending_purchase_at_ms.write() = None;
-                    state.bed_timing_active.store(false, Ordering::Relaxed);
-                }
-            } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
-                // "[Auction] <buyer> bought <item> for <price> coins"
-                // Always claim sold auctions. The active_auction_listings filter was
-                // previously used for coop filtering but it is an in-memory set that
-                // is lost on restart and does not track items listed manually or via
-                // /cofl sell — causing sold auctions like the Hyperion to be silently
-                // skipped. Attempting to claim a coop member's sale is harmless
-                // (the AH UI simply won't show a claim button).
-                if let Some((buyer, item_name, price)) = parse_sold_message(&clean_message) {
-                    // Skip if the buyer is our own bot — Hypixel sends "[Auction] OurName
-                    // bought X for Y coins" as a purchase notification to the buyer as well.
-                    // Without this check the bot would treat its own purchase as a sale,
-                    // producing a false "Item Sold (Loss)" webhook with 0s time-to-sell.
-                    let own_name = state.ingame_name.read().clone();
-                    if !own_name.is_empty() && buyer.eq_ignore_ascii_case(&own_name) {
-                        debug!("[Auction] Ignoring own purchase notification: \"{}\" bought \"{}\" for {}", buyer, item_name, price);
-                    } else {
-                        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
-                        // Housekeeping: remove from active listings if present
-                        state.auction.active_listings.write().remove(&item_key);
-                        // Try to extract the auction UUID from the JSON representation of the
-                        // chat message first — Hypixel embeds "/viewauction <UUID>" in the
-                        // clickEvent of the "CLICK" component, which is invisible in plain text
-                        // but present in the serialised FormattedText JSON.  We try the JSON
-                        // path first because for Hypixel sold messages the UUID is *only* in
-                        // the click event, so trying plain text first would always fail.
-                        let uuid = serde_json::to_string(&chat.message()).ok()
-                            .as_deref()
-                            .and_then(extract_viewauction_uuid)
-                            .or_else(|| extract_viewauction_uuid(&clean_message));
-                        if let Some(ref u) = uuid {
-                            info!("[AH] Extracted viewauction UUID for claim: {}", u);
-                            let mut sold_queue = state.claim_sold_uuid_queue.write();
-                            if !sold_queue.iter().any(|queued| queued == u) {
-                                if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
-                                    sold_queue.pop_front();
-                                }
-                                sold_queue.push_back(u.clone());
-                            }
-                        }
-                        *state.claim_sold_uuid.write() = uuid;
-                        // An auction sold — a slot is now free; clear the auction-limit flag.
-                        if state.auction.at_limit.load(Ordering::Relaxed) {
-                            info!("[Auction] Auction sold, clearing auction-limit flag");
-                            state.auction.at_limit.store(false, Ordering::Relaxed);
-                        }
-                        let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
-                    }
-                }
-            } else if clean_message.contains("You already have an item in the auction slot") {
-                // Hypixel rejected our item placement — there was already an item in the slot.
-                // Close the window (returning the stuck item to inventory) and retry the flow,
-                // up to MAX_AUCTION_STUCK_ITEM_RETRIES times to avoid packet-spam kicks.
-                if *state.bot_state.read() == BotState::Selling {
-                    // fetch_add returns the *previous* value, so attempt 0..2 are the
-                    // 3 retry attempts (when MAX is 3); attempt 3 triggers the give-up.
-                    let attempt = state.auction.stuck_item_retries.fetch_add(1, Ordering::Relaxed);
-
-                    // Common to both paths: abort current flow and close the window.
-                    state.auction.sell_aborted.store(true, Ordering::Relaxed);
-                    let window_id = *state.last_window_id.read();
-                    if window_id > 0 {
-                        send_raw_close(&bot, window_id, &state.handlers);
-                    }
-
-                    if attempt >= MAX_AUCTION_STUCK_ITEM_RETRIES {
-                        warn!(
-                            "[Auction] ABORTING: stuck item in auction slot after {} retries — giving up",
-                            attempt
-                        );
-                        *state.bot_state.write() = BotState::Idle;
-                    } else {
-                        warn!(
-                            "[Auction] ABORTING: \"{}\" — closing window to remove stuck item and retrying (attempt {}/{})",
-                            clean_message, attempt + 1, MAX_AUCTION_STUCK_ITEM_RETRIES
-                        );
-                        // Restart the auction flow: reset step and re-open /ah after a
-                        // delay so Hypixel processes the window close first.
-                        *state.auction.step.write() = AuctionStep::Initial;
-                        let bot_clone = bot.clone();
-                        let state_clone = state.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(AUCTION_RETRY_AFTER_STUCK_ITEM_MS)).await;
-                            // Only retry if still in Selling state (not interrupted by another command)
-                            if *state_clone.bot_state.read() == BotState::Selling {
-                                info!("[Auction] Retrying auction after removing stuck item — sending /ah");
-                                state_clone.auction.sell_aborted.store(false, Ordering::Relaxed);
-                                send_chat_command(&bot_clone, "/ah");
-                            }
-                        });
-                    }
-                }
-            } else if clean_message.contains("BIN Auction started for") {
-                // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
-                // was accepted.  Emit AuctionListed using the context stored in state.
-                // This matches TypeScript sellHandler.ts messageListener pattern.
-                let item = state.auction.item_name.read().clone();
-                let bid  = *state.auction.starting_bid.read();
-                let dur  = *state.auction.duration_hours.read();
-
-                // Diagnostic safety check: verify the listed item roughly matches what
-                // we intended.  Hypixel includes reforge/star prefixes (e.g. "Withered
-                // Valkyrie ✪✪✪✪✪➌") that may not appear in our item_name, so we do a
-                // best-effort bidirectional substring comparison.  This is purely a log
-                // diagnostic — the auction is already created at this point.
-                if let Some(actual_item) = clean_message
-                    .split("BIN Auction started for ")
-                    .nth(1)
-                    .and_then(|s| s.strip_suffix('!'))
-                {
-                    let actual_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(actual_item)
-                        .trim().to_lowercase();
-                    let intended_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item)
-                        .trim().to_lowercase();
-                    if !intended_clean.is_empty() && !actual_clean.contains(&intended_clean) && !intended_clean.contains(&actual_clean) {
-                        error!(
-                            "[Auction] ITEM MISMATCH! Intended: \"{}\" but Hypixel listed: \"{}\". \
-                             This may indicate the wrong item was sold!",
-                            item, actual_item
-                        );
-                    }
-                }
-
-                // Track this as our active listing for coop sale filtering
-                if !item.is_empty() {
-                    let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
-                    state.auction.active_listings.write().insert(item_key);
-                }
-                // Listing succeeded — clear any stale auction-limit flag.
-                state.auction.at_limit.store(false, Ordering::Relaxed);
-                if !item.is_empty() {
-                    info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
-                    let _ = state.event_tx.send(BotEvent::AuctionListed {
-                        item_name: item,
-                        starting_bid: bid,
-                        duration_hours: dur,
-                    });
-                }
-            } else if clean_message.contains("This BIN sale is still in its grace period!") {
-                // Hypixel rejected the buy click because the BIN is in its grace period,
-                // but slot 31 already shows gold_nugget (not a bed).  Keep clicking every
-                // 100 ms until the Confirm Purchase window opens — matches
-                // AutoBuy.initBedSpam() which clicks whenever slotName === "gold_nugget".
-                if *state.bot_state.read() == BotState::Purchasing {
-                    let already_active = state.grace_period_spam_active.swap(true, Ordering::Relaxed);
-                    if !already_active {
-                        let bot_clone = bot.clone();
-                        let window_id = *state.last_window_id.read();
-                        let shared_window_id = state.last_window_id.clone();
-                        let bot_state = state.bot_state.clone();
-                        let spam_flag = state.grace_period_spam_active.clone();
-                        let click_interval_ms = state.bed_spam_click_delay.max(1);
-                        info!("[AH] Grace period detected — starting bed spam ({} ms interval)", click_interval_ms);
-                        tokio::spawn(async move {
-                            const MAX_FAILED_CLICKS: usize = 5;
-                            let mut failed_clicks: usize = 0;
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
-                                let current_window_id = *shared_window_id.read();
-                                if current_window_id != window_id {
-                                    info!(
-                                        "[AH] Grace period spam: window changed ({} -> {}), stopping",
-                                        window_id, current_window_id
-                                    );
-                                    break;
-                                }
-                                let current_kind = {
-                                    let menu = bot_clone.menu();
-                                    let slots = menu.slots();
-                                    slots.get(31).map(|s| {
-                                        if s.is_empty() { "air".to_string() }
-                                        else { s.kind().to_string().to_lowercase() }
-                                    }).unwrap_or_else(|| "air".to_string())
-                                };
-                                if current_kind.contains("air") {
-                                    info!("[AH] Grace period spam: window closed");
-                                    *bot_state.write() = BotState::Idle;
-                                    break;
-                                } else if current_kind.contains("gold_nugget") {
-                                    // Grace period may still be active — keep clicking.
-                                    // Reset failed counter: slot is correct, just waiting.
-                                    failed_clicks = 0;
-                                    click_window_slot(&bot_clone, &shared_window_id, window_id, 31).await;
-                                } else {
-                                    failed_clicks += 1;
-                                    debug!("[AH] Grace period spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
-                                    if failed_clicks >= MAX_FAILED_CLICKS {
-                                        warn!("[AH] Grace period spam stopped after {} failed clicks", failed_clicks);
-                                        *bot_state.write() = BotState::Idle;
-                                        break;
-                                    }
-                                }
-                            }
-                            spam_flag.store(false, Ordering::Relaxed);
-                        });
-                    }
-                }
-            }
-
-            // Detect bazaar order limit ("You reached your maximum of XY Bazaar orders!")
-            // and clear it when an order fills ("Claimed ... coins from ...").
-            if clean_message.contains("You reached your maximum of") && clean_message.contains("Bazaar orders") {
-                warn!("[Bazaar] Order limit reached — pausing bazaar flips until a slot frees up");
-                state.bazaar.at_limit.store(true, Ordering::Relaxed);
-            } else if clean_message.contains("[Bazaar]") && (clean_message.contains("coins from selling") || clean_message.contains("coins from buying")) {
-                // An order was collected — a slot is now free
-                if state.bazaar.at_limit.load(Ordering::Relaxed) {
-                    info!("[Bazaar] Order collected, clearing order-limit flag");
-                    state.bazaar.at_limit.store(false, Ordering::Relaxed);
-                }
-            }
-
-            // Detect bazaar daily sell value limit
-            if clean_message.contains("You reached the daily limit") && clean_message.contains("bazaar") {
-                warn!("[Bazaar] Daily sell value limit reached — pausing bazaar flips until 0:00 UTC");
-                state.bazaar.daily_limit.store(true, Ordering::Relaxed);
-            }
-
-            // Detect bazaar order rejection ("Your price isn't competitive enough")
-            // so the confirm handler knows not to emit BazaarOrderPlaced.
-            if clean_message.contains("[Bazaar]") && clean_message.contains("Your price isn't competitive enough") {
-                warn!("[Bazaar] Order rejected — price not competitive");
-                state.bazaar.order_rejected.store(true, Ordering::Relaxed);
-            }
-
-            // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
-            // ManageOrders run so the filled items are collected promptly.
-            if let Some((filled_item, is_buy)) = parse_bazaar_filled_notification(&clean_message) {
-                info!("[BazaarOrders] Order fill notification — {} \"{}\"", if is_buy { "BUY" } else { "SELL" }, filled_item);
-                let _ = state.event_tx.send(BotEvent::BazaarOrderFilled {
-                    item_name: filled_item,
-                    is_buy_order: is_buy,
-                });
-            }
-
-            // Detect "You don't have the space required to claim that!" and set the
-            // inventory_full flag so ManageOrders can stop and log remaining orders.
-            if clean_message.contains("don't have the space required to claim") {
-                warn!("[ManageOrders] Inventory full — logging unclaimed orders");
-                state.inventory_full.store(true, Ordering::Relaxed);
-            }
-
-            // Detect "You have X item(s) stashed away!" — Hypixel sends this both
-            // when items are newly stashed AND as a periodic reminder while any
-            // stashed items exist.  Only set inventory_full if the player
-            // inventory actually has very few free slots (≤ 2), because the
-            // reminder keeps firing long after the player frees space via
-            // instasell or other means.
-            if clean_message.contains("stashed away") {
-                let empty = count_empty_player_slots(&bot);
-                if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
-                    warn!("[ManageOrders] Items stashed and inventory nearly full ({} empty slots)", empty);
-                    state.inventory_full.store(true, Ordering::Relaxed);
-                } else {
-                    debug!("[ManageOrders] Stashed-away reminder ignored — inventory has {} empty slots", empty);
-                }
-            }
-
-            // Detect "Inventory full? Don't forget to check out your Storage
-            // inside the SkyBlock Menu!" — Hypixel sends this frequently when
-            // the player's inventory is full.  Only set the flag when inventory
-            // truly has very few free slots, in case the message arrives after
-            // the player freed space (e.g. via manual instasell).
-            if clean_message.contains("Inventory full?") {
-                let empty = count_empty_player_slots(&bot);
-                if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
-                    warn!("[ManageOrders] Inventory full hint detected ({} empty slots)", empty);
-                    state.inventory_full.store(true, Ordering::Relaxed);
-                } else {
-                    debug!("[ManageOrders] Inventory-full hint ignored — inventory has {} empty slots", empty);
-                }
-            }
-
-            // Detect "You don't have anything to sell!" during SellingInventoryBz
-            // — Hypixel sends this when inventory has no instasellable items.
-            if clean_message.contains("don't have anything to sell")
-                && *state.bot_state.read() == BotState::SellingInventoryBz
-            {
-                info!("[SellInventoryBz] Nothing to sell — closing window and going idle");
-                *state.bazaar.sell_inventory_step.write() = SellInventoryStep::Initial;
-                let wid = *state.last_window_id.read();
-                if wid > 0 {
-                    send_raw_close(&bot, wid, &state.handlers);
-                }
-                *state.bot_state.write() = BotState::Idle;
-            }
-
-            // Check if we've teleported to island yet
-            let teleported = *state.teleported_to_island.read();
-            let join_time = *state.skyblock_join_time.read();
-            
-            // Look for messages indicating we're in SkyBlock and should go to island
-            if let Some(join_time) = join_time {
-                if !teleported {
-                    // Check for timeout (if we've been waiting too long, try anyway)
-                    let should_timeout = join_time.elapsed() > tokio::time::Duration::from_secs(SKYBLOCK_JOIN_TIMEOUT_SECS);
-                    
-                    // Check if message is a SkyBlock join confirmation
-                    let skyblock_detected = {
-                        if clean_message.starts_with("Welcome to Hypixel SkyBlock") {
-                            true
-                        }
-                        else if clean_message.starts_with("[Profile]") && clean_message.contains("currently") {
-                            true
-                        }
-                        else if clean_message.starts_with("[") {
-                            let upper = clean_message.to_uppercase();
-                            upper.contains("SKYBLOCK") && upper.contains("PROFILE")
-                        } else {
-                            false
-                        }
-                    };
-                    
-                    if skyblock_detected || should_timeout {
-                        // Mark as joined now that we've confirmed
-                        *state.joined_skyblock.write() = true;
-                        *state.teleported_to_island.write() = true;
-                        
-                        if should_timeout {
-                            info!("Timeout waiting for SkyBlock confirmation - attempting to teleport to island anyway...");
-                        } else {
-                            info!("Detected SkyBlock join - teleporting to island...");
-                        }
-                        
-                        // Spawn a task to handle teleportation and startup workflow (non-blocking)
-                        let bot_clone = bot.clone();
-                        let bot_state = state.bot_state.clone();
-                        let event_tx_startup = state.event_tx.clone();
-                        let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
-                        let auto_cookie_startup = state.auto_cookie_hours.clone();
-                        let command_queue_startup = state.command_queue.clone();
-                        let startup_in_progress_startup = state.startup_in_progress.clone();
-                        let enable_bazaar_flips_startup = state.enable_bazaar_flips.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
-                            send_chat_command(&bot_clone, "/is");
-                            
-                            // Wait for teleport to complete
-                            tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_queue_startup, startup_in_progress_startup, enable_bazaar_flips_startup).await;
-                        });
-                    }
-                }
-            }
-        }
+        Event::Chat(chat) => { handle_event_chat(&bot, &state, chat).await; }
         
-        Event::Packet(packet) => {
-            // Handle specific packets for window open/close and inventory updates
-            match packet.as_ref() {
-                ClientboundGamePacket::OpenScreen(open_screen) => {
-                    // Record the instant the OpenScreen packet reaches our
-                    // event handler via the Event::Packet channel pipeline.
-                    let event_handler_at = std::time::Instant::now();
-
-                    // If a purchase is in-flight, compare the ECS observer timestamp
-                    // (set by PacketAcceleratorPlugin during apply_deferred) with the
-                    // Event::Packet handler timestamp to measure pipeline overhead.
-                    if let Some(t0) = *state.purchase_start_time.read() {
-                        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        // Read the observer timestamp, dropping the lock immediately.
-                        let observer_ts = state.window_open_info.read()
-                            .as_ref()
-                            .map(|info| info.timestamp);
-                        if let Some(obs_ts) = observer_ts {
-                            let observer_ms = obs_ts.duration_since(t0).as_secs_f64() * 1000.0;
-                            let pipeline_ms = event_handler_at
-                                .duration_since(obs_ts)
-                                .as_secs_f64() * 1000.0;
-                            info!(
-                                "[Timing] /viewauction → window: ECS observer {:.1}ms, \
-                                 Event::Packet handler {:.1}ms (+{:.1}ms pipeline overhead)",
-                                observer_ms, total_ms, pipeline_ms
-                            );
-                        } else {
-                            info!(
-                                "[Timing] /viewauction → OpenScreen handler: {:.1}ms \
-                                 (ECS observer did not fire — check PacketAcceleratorPlugin)",
-                                total_ms
-                            );
-                        }
-                    }
-
-                    let window_id = open_screen.container_id;
-                    let window_type = format!("{:?}", open_screen.menu_type);
-                    let title = open_screen.title.to_string();
-                    
-                    // Parse the title from JSON format
-                    let parsed_title = state.handlers.parse_window_title(&title);
-                    
-                    // Store window ID
-                    *state.last_window_id.write() = window_id as u8;
-                    
-                    state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
-
-                    // Log the synchronous overhead of the OpenScreen handler
-                    // itself (title parsing + state writes + logging).  This
-                    // should be <1 ms; if it is significantly higher, a lock
-                    // contention problem exists.
-                    if let Some(t0) = *state.purchase_start_time.read() {
-                        let handler_ms = event_handler_at.elapsed().as_secs_f64() * 1000.0;
-                        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        info!(
-                            "[Timing] OpenScreen handler overhead: {:.2}ms \
-                             (total since /viewauction: {:.1}ms)",
-                            handler_ms, total_ms
-                        );
-                    }
-                    // Defer the (expensive) window-JSON rebuild so the event
-                    // handler returns faster.  On the purchase path this is
-                    // critical: ContainerSetContent may arrive in the very next
-                    // packet frame and its handler must fire
-                    // slot_data_notify.notify_waiters() without waiting for the
-                    // JSON rebuild to finish.
-                    {
-                        let cache_bot = bot.clone();
-                        let cache_state = state.clone();
-                        tokio::spawn(async move {
-                            rebuild_cached_window_json(&cache_bot, &cache_state);
-                        });
-                    }
-                    if state.event_tx.send(BotEvent::WindowOpen(window_id as u8, window_type.clone(), parsed_title.clone())).is_err() {
-                        debug!("Failed to send WindowOpen event - receiver dropped");
-                    }
-
-                    // Spawn a 5-second watchdog: if this window is still open in an
-                    // interactive bot state after 5 s it is considered stuck and is
-                    // closed automatically.  Matches user requirement "guis should
-                    // autoclose if not used for over 5 seconds".
-                    // Exception: bed (grace-period) timing — the BIN Auction View must
-                    // stay open for up to 60 s while waiting for the grace period to end.
-                    // Also skips if a newer command started since this window was opened
-                    // (prevents a stale watchdog from interrupting a new command).
-                    {
-                        let wdog_bot   = bot.clone();
-                        let wdog_wid   = window_id as u8;
-                        let wdog_state = state.bot_state.clone();
-                        let wdog_last  = state.last_window_id.clone();
-                        let wdog_spam  = state.grace_period_spam_active.clone();
-                        let wdog_bed   = state.bed_timing_active.clone();
-                        let wdog_gen   = state.command_generation.clone();
-                        let wdog_gen_at_open = state.command_generation.load(Ordering::SeqCst);
-                        let wdog_deadline = state.bazaar.manage_orders_deadline.clone();
-                        let wdog_bz_limit = state.bazaar.at_limit.clone();
-                        let wdog_handlers = state.handlers.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                            let still_open  = *wdog_last.read() == wdog_wid;
-                            let cur_state   = *wdog_state.read();
-                            let is_bed      = wdog_bed.load(Ordering::Relaxed);
-                            let is_interactive = matches!(cur_state,
-                                BotState::Purchasing | BotState::Bazaar | BotState::Selling
-                                | BotState::ClaimingPurchased | BotState::ClaimingSold
-                                | BotState::InstaSelling
-                                | BotState::CancellingAuction | BotState::SellingInventoryBz
-                                | BotState::ManagingOrders
-                            );
-                            // Only fire if no new command started since this window was opened.
-                            let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
-                            if still_open && is_interactive && !is_bed && gen_unchanged {
-                                warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
-                                send_raw_close(&wdog_bot, wdog_wid, &wdog_handlers);
-                                // Clean up ManagingOrders-specific state so the bot
-                                // doesn't remain stuck with a stale deadline or the
-                                // bazaar order-limit flag blocking new flips.
-                                if cur_state == BotState::ManagingOrders {
-                                    *wdog_deadline.write() = None;
-                                    wdog_bz_limit.store(false, Ordering::Relaxed);
-                                }
-                                *wdog_state.write() = BotState::Idle;
-                                wdog_spam.store(false, Ordering::Relaxed);
-                            }
-                        });
-                    }
-
-                    // Handle window interactions in a spawned task so this event
-                    // handler returns immediately.  This is critical for the
-                    // purchase flow: if ContainerSetContent arrives in a
-                    // separate packet frame, its handler must be able to fire
-                    // slot_data_notify.notify_waiters() without waiting for the
-                    // OpenScreen handler to finish.
-                    {
-                        let bot_s = bot.clone();
-                        let state_s = state.clone();
-                        let title_s = parsed_title.clone();
-                        tokio::spawn(async move {
-                            let result = std::panic::AssertUnwindSafe(
-                                handle_window_interaction(&bot_s, &state_s, window_id as u8, &title_s)
-                            );
-                            if let Err(e) = futures::FutureExt::catch_unwind(result).await {
-                                error!("[WindowHandler] panic in handle_window_interaction: {:?}", e);
-                            }
-                        });
-                    }
-                }
-                
-                ClientboundGamePacket::ContainerClose(_) => {
-                    // Clear grace-period spam and bed-timing flags so a new BIN Auction View
-                    // can start fresh.
-                    state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                    *state.pending_purchase_at_ms.write() = None;
-                    state.bed_timing_active.store(false, Ordering::Relaxed);
-                    state.handlers.handle_window_close().await;
-                    // Defer the window-JSON rebuild so the event handler returns
-                    // quickly.  bot.menu() briefly locks the ECS World mutex; doing
-                    // the full NBT-extraction + JSON-serialisation synchronously
-                    // keeps that contention window open and delays the next ECS
-                    // schedule cycle, contributing to slow frames.
-                    {
-                        let bot_close = bot.clone();
-                        let state_close = state.clone();
-                        tokio::spawn(async move {
-                            rebuild_cached_window_json(&bot_close, &state_close);
-                        });
-                    }
-                    if state.event_tx.send(BotEvent::WindowClose).is_err() {
-                        debug!("Failed to send WindowClose event - receiver dropped");
-                    }
-                }
-                
-                ClientboundGamePacket::ContainerSetSlot(_slot_update) => {
-                    // Wake the purchase handler FIRST so it can react to slot 31
-                    // data on another thread without waiting for the inventory
-                    // JSON rebuild.
-                    state.slot_data_notify.notify_waiters();
-                    // Debounce the inventory-JSON rebuild: individual slot updates
-                    // can fire dozens of times per GUI interaction.  Each call locks
-                    // the ECS World mutex (via bot.menu()) and serialises all
-                    // inventory slots to JSON.  Coalescing into a single rebuild
-                    // after the debounce window dramatically reduces both CPU usage
-                    // and World-lock contention that causes slow ECS frames.
-                    if !state.inventory_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
-                        let bot_inv = bot.clone();
-                        let state_inv = state.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(INVENTORY_CACHE_REBUILD_DEBOUNCE_MS)).await;
-                            rebuild_cached_inventory_json(&bot_inv, &state_inv);
-                            state_inv.inventory_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
-                        });
-                    }
-                    // Debounce the window-JSON rebuild: individual slot updates can fire
-                    // dozens of times per GUI interaction.  Coalesce them into a single
-                    // rebuild after the debounce window to avoid excessive CPU from
-                    // repeated NBT extraction + JSON serialisation.
-                    if !state.window_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
-                        let bot_clone = bot.clone();
-                        let state_clone = state.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CACHE_REBUILD_DEBOUNCE_MS)).await;
-                            rebuild_cached_window_json(&bot_clone, &state_clone);
-                            state_clone.window_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
-                        });
-                    }
-                }
-                
-                ClientboundGamePacket::ContainerSetContent(_content) => {
-                    // Log when ContainerSetContent arrives during a purchase
-                    // flow — this populates slot 31 and unblocks the buy-click.
-                    if let Some(t0) = *state.purchase_start_time.read() {
-                        if *state.bot_state.read() == BotState::Purchasing {
-                            info!(
-                                "[Timing] /viewauction → ContainerSetContent: {:.1}ms",
-                                t0.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-                    }
-                    // Wake the purchase handler FIRST so it can react to slot 31
-                    // data on another thread without waiting for the inventory
-                    // JSON rebuild.
-                    state.slot_data_notify.notify_waiters();
-                    // Defer both JSON rebuilds so the event handler returns quickly.
-                    // Each rebuild calls bot.menu() which briefly locks the ECS World
-                    // mutex; running them synchronously keeps the handler blocked for
-                    // 20-50 ms of NBT extraction + JSON serialisation, starving
-                    // subsequent event processing and increasing World-lock contention
-                    // with the ECS schedule loop (causing slow frames).
-                    {
-                        let bot_inv = bot.clone();
-                        let state_inv = state.clone();
-                        tokio::spawn(async move {
-                            rebuild_cached_inventory_json(&bot_inv, &state_inv);
-                        });
-                    }
-                    {
-                        let bot_win = bot.clone();
-                        let state_win = state.clone();
-                        tokio::spawn(async move {
-                            rebuild_cached_window_json(&bot_win, &state_win);
-                        });
-                    }
-                }
-
-                ClientboundGamePacket::OpenSignEditor(pkt) => {
-                    // Hypixel sends this when the bot clicks "Custom Amount", "Custom Price"
-                    // (bazaar), slot 31 (auction price), or slot 16 in "Auction Duration".
-                    // We respond immediately with ServerboundSignUpdate to write the value
-                    // (matching TypeScript's bot._client.once('open_sign_entity')).
-                    let bot_state = *state.bot_state.read();
-                    if bot_state == BotState::Bazaar {
-                        let step = *state.bazaar.step.read();
-                        let pos = pkt.pos;
-                        let is_front = pkt.is_front_text;
-
-                        let text_to_write = match step {
-                            BazaarStep::SetAmount => {
-                                let amount = *state.bazaar.amount.read();
-                                info!("[Bazaar] Sign opened for amount — writing: {}", amount);
-                                amount.to_string()
-                            }
-                            BazaarStep::SetPrice => {
-                                let price = *state.bazaar.price_per_unit.read();
-                                let s = format_price_for_sign(price);
-                                info!("[Bazaar] Sign opened for price — writing: {}", s);
-                                s
-                            }
-                            BazaarStep::SelectOrderType => {
-                                // Hypixel opened a sign directly after clicking "Create Sell/Buy Order"
-                                // (direct-sign flow — no intermediate "Custom Price" GUI button).
-                                // Treat this as the price sign (matching TypeScript behaviour where
-                                // sell offers go straight to the price sign).
-                                let price = *state.bazaar.price_per_unit.read();
-                                let s = format_price_for_sign(price);
-                                info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", s);
-                                *state.bazaar.step.write() = BazaarStep::SetPrice;
-                                s
-                            }
-                            _ => {
-                                warn!("[Bazaar] Unexpected sign opened at step {:?}", step);
-                                return Ok(());
-                            }
-                        };
-
-                        // Sign format exactly matching TypeScript bazaarFlipHandler.ts:
-                        // text1: the value (price or amount as plain string)
-                        // text2: "^^^^^^^^^^^^^^^" hint arrows (from JSON extra["^^^^^^^^^^^^^^^"])
-                        // text3, text4: empty
-                        let packet = ServerboundSignUpdate {
-                            pos,
-                            is_front_text: is_front,
-                            lines: [
-                                text_to_write,
-                                "^^^^^^^^^^^^^^^".to_string(),
-                                String::new(),
-                                String::new(),
-                            ],
-                        };
-                        bot.write_packet(packet);
-                    } else if bot_state == BotState::Selling {
-                        // Auction sign handler — matches TypeScript's setAuctionDuration and
-                        // bot._client.once('open_sign_entity') for price in sellHandler.ts
-                        if state.auction.sell_aborted.load(Ordering::Relaxed) {
-                            warn!("[Auction] Sign opened but auction sell aborted — skipping");
-                            return Ok(());
-                        }
-                        let step = *state.auction.step.read();
-                        let pos = pkt.pos;
-                        let is_front = pkt.is_front_text;
-
-                        let (text_to_write, next_step) = match step {
-                            AuctionStep::PriceSign => {
-                                let price = *state.auction.starting_bid.read();
-                                info!("[Auction] Sign opened for price — writing: {}", price);
-                                (price.to_string(), AuctionStep::SetDuration)
-                            }
-                            AuctionStep::DurationSign => {
-                                let hours = *state.auction.duration_hours.read();
-                                info!("[Auction] Sign opened for duration — writing: {} hours", hours);
-                                (hours.to_string(), AuctionStep::ConfirmSell)
-                            }
-                            _ => {
-                                warn!("[Auction] Unexpected sign opened at step {:?}", step);
-                                return Ok(());
-                            }
-                        };
-
-                        *state.auction.step.write() = next_step;
-                        let packet = ServerboundSignUpdate {
-                            pos,
-                            is_front_text: is_front,
-                            lines: [
-                                text_to_write,
-                                String::new(),
-                                String::new(),
-                                String::new(),
-                            ],
-                        };
-                        bot.write_packet(packet);
-                    }
-                }
-
-                // ---- Scoreboard packets ----
-                // Track scoreboard data from Hypixel SkyBlock sidebar.
-                // The sidebar contains player purse, stats, etc. which COFL uses
-                // to validate flip eligibility (e.g. purse check before buying).
-
-                ClientboundGamePacket::SetDisplayObjective(pkt) => {
-                    // Slot 1 = sidebar
-                    if matches!(pkt.slot, DisplaySlot::Sidebar) {
-                        *state.sidebar_objective.write() = Some(pkt.objective_name.clone());
-                        debug!("[Scoreboard] Sidebar objective set to: {}", pkt.objective_name);
-                    }
-                }
-
-                ClientboundGamePacket::SetScore(pkt) => {
-                    // Store score entry: objective -> owner -> (display, score)
-                    // Hypixel SkyBlock encodes sidebar text in the owner field;
-                    // the optional display override is absent for most entries.
-                    let display_text = pkt.display
-                        .as_ref()
-                        .and_then(|d| { let s = d.to_string(); if s.is_empty() { None } else { Some(s) } })
-                        .unwrap_or_else(|| pkt.owner.clone());
-                    state.scoreboard_scores
-                        .write()
-                        .entry(pkt.objective_name.clone())
-                        .or_default()
-                        .insert(pkt.owner.clone(), (display_text, pkt.score));
-                }
-
-                ClientboundGamePacket::ResetScore(pkt) => {
-                    // Remove a score entry
-                    let mut scores = state.scoreboard_scores.write();
-                    if let Some(obj_name) = &pkt.objective_name {
-                        if let Some(objective) = scores.get_mut(obj_name.as_str()) {
-                            objective.remove(&pkt.owner);
-                        }
-                    } else {
-                        // Remove from all objectives
-                        for objective in scores.values_mut() {
-                            objective.remove(&pkt.owner);
-                        }
-                    }
-                }
-
-                ClientboundGamePacket::SetPlayerTeam(pkt) => {
-                    // Track team prefix/suffix for scoreboard display.
-                    // Hypixel SkyBlock uses team-based encoding: the team prefix
-                    // contains the actual visible text; the score entry owner (e.g. §y)
-                    // is used only as a unique identifier.
-                    let mut teams = state.scoreboard_teams.write();
-                    match &pkt.method {
-                        TeamMethod::Add((params, members)) => {
-                            let prefix = params.player_prefix.to_string();
-                            let suffix = params.player_suffix.to_string();
-                            teams.insert(pkt.name.clone(), (prefix, suffix, members.clone()));
-                        }
-                        TeamMethod::Remove => {
-                            teams.remove(&pkt.name);
-                        }
-                        TeamMethod::Change(params) => {
-                            let prefix = params.player_prefix.to_string();
-                            let suffix = params.player_suffix.to_string();
-                            let (entry_prefix, entry_suffix, _) = teams
-                                .entry(pkt.name.clone())
-                                .or_insert_with(|| (String::new(), String::new(), Vec::new()));
-                            *entry_prefix = prefix;
-                            *entry_suffix = suffix;
-                        }
-                        TeamMethod::Join(members) => {
-                            let (_, _, entry_members) = teams
-                                .entry(pkt.name.clone())
-                                .or_insert_with(|| (String::new(), String::new(), Vec::new()));
-                            entry_members.extend(members.clone());
-                        }
-                        TeamMethod::Leave(members) => {
-                            if let Some((_, _, entry_members)) = teams.get_mut(&pkt.name) {
-                                let leaving: std::collections::HashSet<&String> = members.iter().collect();
-                                entry_members.retain(|m| !leaving.contains(m));
-                            }
-                        }
-                    }
-                }
-                
-                _ => {}
-            }
-        }
+        Event::Packet(packet) => { handle_event_packet(&bot, &state, packet).await; }
         
-        Event::Disconnect(reason) => {
-            info!("Bot disconnected: {:?}", reason);
-            let reason_str = format!("{:?}", reason);
-            if state.event_tx.send(BotEvent::Disconnected(reason_str)).is_err() {
-                debug!("Failed to send Disconnected event - receiver dropped");
-            }
-        }
+        Event::Disconnect(reason) => { handle_event_disconnect(&bot, &state, reason).await; }
         
         _ => {}
     }
@@ -4079,6 +3226,882 @@ async fn run_startup_workflow(
     startup_in_progress.store(false, Ordering::Relaxed);
     let _ = event_tx.send(BotEvent::StartupComplete { orders_cancelled });
 }
+
+// ---------------------------------------------------------------------------
+// Packet / chat / disconnect event handlers — broken out from event_handler.
+// ---------------------------------------------------------------------------
+
+async fn handle_event_chat(
+    bot: &Client,
+    state: &BotClientState,
+    chat: azalea_client::chat::ChatPacket,
+) {
+        // Filter out overlay messages (action bar - e.g., health/defense/mana stats)
+        let is_overlay = matches!(chat, ChatPacket::System(ref packet) if packet.overlay);
+        
+        if is_overlay {
+            // Skip overlay messages - they spam the logs with stats updates
+            return;
+        }
+        
+        let message = chat.message().to_string();
+        state.handlers.handle_chat_message(&message).await;
+        if state.event_tx.send(BotEvent::ChatMessage(message.clone())).is_err() {
+            debug!("Failed to send ChatMessage event - receiver dropped");
+        }
+
+        // Buffer the message for periodic chatBatch upload to Coflnet.
+        // Uses clean text (color codes stripped) matching the Coflnet mod protocol.
+        let clean_for_batch = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
+        if !clean_for_batch.trim().is_empty() {
+            state.chat_batch_buffer.write().push(clean_for_batch);
+        }
+
+        // Detect purchase/sold messages and emit events
+        let clean_message = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
+
+        if clean_message.contains("You purchased") && clean_message.contains("coins!") {
+            // "You purchased <item> for <price> coins!"
+            if let Some((item_name, price)) = parse_purchased_message(&clean_message) {
+                // Include the buy speed measured from flip received to escrow message
+                let buy_speed_ms = state.last_buy_speed_ms.write().take();
+                let _ = state.event_tx.send(BotEvent::ItemPurchased { item_name, price, buy_speed_ms });
+            }
+        } else if clean_message.contains("Putting coins in escrow") {
+            // "Putting coins in escrow..." — purchase accepted by server.
+            // Calculate buy speed from when /viewauction was sent.
+            if let Some(start) = state.purchase_start_time.write().take() {
+                let speed_ms = start.elapsed().as_millis() as u64;
+                *state.last_buy_speed_ms.write() = Some(speed_ms);
+                let _ = state.event_tx.send(BotEvent::ChatMessage(
+                    format!("§f[§4BAF§f]: §aAuction bought in {}ms", speed_ms)
+                ));
+                info!("[AH] Buy speed: {}ms", speed_ms);
+            }
+        } else if *state.bot_state.read() == BotState::Purchasing
+            && is_terminal_purchase_failure_message(&clean_message)
+        {
+            // Abort immediately on terminal purchase failure messages so we don't keep a
+            // stale purchasing window open for 5s and overlap the next queued command.
+            // Use write lock for atomic check-and-set to prevent a double-close race
+            // with the slot-31 non-buyable handler (both can fire concurrently when
+            // e.g. a potato + "You didn't participate" arrive at the same time).
+            let should_close = {
+                let mut bs = state.bot_state.write();
+                if *bs == BotState::Purchasing {
+                    *bs = BotState::Idle;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_close {
+                let window_id = *state.last_window_id.read();
+                warn!(
+                    "[AH] Terminal purchase failure detected: \"{}\" — closing window {}",
+                    clean_message, window_id
+                );
+                if window_id > 0 {
+                    send_raw_close(&bot, window_id, &state.handlers);
+                }
+                state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                state.skip_click_sent.store(false, Ordering::Relaxed);
+                *state.purchase_start_time.write() = None;
+                *state.pending_purchase_at_ms.write() = None;
+                state.bed_timing_active.store(false, Ordering::Relaxed);
+            }
+        } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
+            // "[Auction] <buyer> bought <item> for <price> coins"
+            // Always claim sold auctions. The active_auction_listings filter was
+            // previously used for coop filtering but it is an in-memory set that
+            // is lost on restart and does not track items listed manually or via
+            // /cofl sell — causing sold auctions like the Hyperion to be silently
+            // skipped. Attempting to claim a coop member's sale is harmless
+            // (the AH UI simply won't show a claim button).
+            if let Some((buyer, item_name, price)) = parse_sold_message(&clean_message) {
+                // Skip if the buyer is our own bot — Hypixel sends "[Auction] OurName
+                // bought X for Y coins" as a purchase notification to the buyer as well.
+                // Without this check the bot would treat its own purchase as a sale,
+                // producing a false "Item Sold (Loss)" webhook with 0s time-to-sell.
+                let own_name = state.ingame_name.read().clone();
+                if !own_name.is_empty() && buyer.eq_ignore_ascii_case(&own_name) {
+                    debug!("[Auction] Ignoring own purchase notification: \"{}\" bought \"{}\" for {}", buyer, item_name, price);
+                } else {
+                    let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+                    // Housekeeping: remove from active listings if present
+                    state.auction.active_listings.write().remove(&item_key);
+                    // Try to extract the auction UUID from the JSON representation of the
+                    // chat message first — Hypixel embeds "/viewauction <UUID>" in the
+                    // clickEvent of the "CLICK" component, which is invisible in plain text
+                    // but present in the serialised FormattedText JSON.  We try the JSON
+                    // path first because for Hypixel sold messages the UUID is *only* in
+                    // the click event, so trying plain text first would always fail.
+                    let uuid = serde_json::to_string(&chat.message()).ok()
+                        .as_deref()
+                        .and_then(extract_viewauction_uuid)
+                        .or_else(|| extract_viewauction_uuid(&clean_message));
+                    if let Some(ref u) = uuid {
+                        info!("[AH] Extracted viewauction UUID for claim: {}", u);
+                        let mut sold_queue = state.claim_sold_uuid_queue.write();
+                        if !sold_queue.iter().any(|queued| queued == u) {
+                            if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
+                                sold_queue.pop_front();
+                            }
+                            sold_queue.push_back(u.clone());
+                        }
+                    }
+                    *state.claim_sold_uuid.write() = uuid;
+                    // An auction sold — a slot is now free; clear the auction-limit flag.
+                    if state.auction.at_limit.load(Ordering::Relaxed) {
+                        info!("[Auction] Auction sold, clearing auction-limit flag");
+                        state.auction.at_limit.store(false, Ordering::Relaxed);
+                    }
+                    let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
+                }
+            }
+        } else if clean_message.contains("You already have an item in the auction slot") {
+            // Hypixel rejected our item placement — there was already an item in the slot.
+            // Close the window (returning the stuck item to inventory) and retry the flow,
+            // up to MAX_AUCTION_STUCK_ITEM_RETRIES times to avoid packet-spam kicks.
+            if *state.bot_state.read() == BotState::Selling {
+                // fetch_add returns the *previous* value, so attempt 0..2 are the
+                // 3 retry attempts (when MAX is 3); attempt 3 triggers the give-up.
+                let attempt = state.auction.stuck_item_retries.fetch_add(1, Ordering::Relaxed);
+
+                // Common to both paths: abort current flow and close the window.
+                state.auction.sell_aborted.store(true, Ordering::Relaxed);
+                let window_id = *state.last_window_id.read();
+                if window_id > 0 {
+                    send_raw_close(&bot, window_id, &state.handlers);
+                }
+
+                if attempt >= MAX_AUCTION_STUCK_ITEM_RETRIES {
+                    warn!(
+                        "[Auction] ABORTING: stuck item in auction slot after {} retries — giving up",
+                        attempt
+                    );
+                    *state.bot_state.write() = BotState::Idle;
+                } else {
+                    warn!(
+                        "[Auction] ABORTING: \"{}\" — closing window to remove stuck item and retrying (attempt {}/{})",
+                        clean_message, attempt + 1, MAX_AUCTION_STUCK_ITEM_RETRIES
+                    );
+                    // Restart the auction flow: reset step and re-open /ah after a
+                    // delay so Hypixel processes the window close first.
+                    *state.auction.step.write() = AuctionStep::Initial;
+                    let bot_clone = bot.clone();
+                    let state_clone = state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(AUCTION_RETRY_AFTER_STUCK_ITEM_MS)).await;
+                        // Only retry if still in Selling state (not interrupted by another command)
+                        if *state_clone.bot_state.read() == BotState::Selling {
+                            info!("[Auction] Retrying auction after removing stuck item — sending /ah");
+                            state_clone.auction.sell_aborted.store(false, Ordering::Relaxed);
+                            send_chat_command(&bot_clone, "/ah");
+                        }
+                    });
+                }
+            }
+        } else if clean_message.contains("BIN Auction started for") {
+            // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
+            // was accepted.  Emit AuctionListed using the context stored in state.
+            // This matches TypeScript sellHandler.ts messageListener pattern.
+            let item = state.auction.item_name.read().clone();
+            let bid  = *state.auction.starting_bid.read();
+            let dur  = *state.auction.duration_hours.read();
+
+            // Diagnostic safety check: verify the listed item roughly matches what
+            // we intended.  Hypixel includes reforge/star prefixes (e.g. "Withered
+            // Valkyrie ✪✪✪✪✪➌") that may not appear in our item_name, so we do a
+            // best-effort bidirectional substring comparison.  This is purely a log
+            // diagnostic — the auction is already created at this point.
+            if let Some(actual_item) = clean_message
+                .split("BIN Auction started for ")
+                .nth(1)
+                .and_then(|s| s.strip_suffix('!'))
+            {
+                let actual_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(actual_item)
+                    .trim().to_lowercase();
+                let intended_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item)
+                    .trim().to_lowercase();
+                if !intended_clean.is_empty() && !actual_clean.contains(&intended_clean) && !intended_clean.contains(&actual_clean) {
+                    error!(
+                        "[Auction] ITEM MISMATCH! Intended: \"{}\" but Hypixel listed: \"{}\". \
+                         This may indicate the wrong item was sold!",
+                        item, actual_item
+                    );
+                }
+            }
+
+            // Track this as our active listing for coop sale filtering
+            if !item.is_empty() {
+                let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
+                state.auction.active_listings.write().insert(item_key);
+            }
+            // Listing succeeded — clear any stale auction-limit flag.
+            state.auction.at_limit.store(false, Ordering::Relaxed);
+            if !item.is_empty() {
+                info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
+                let _ = state.event_tx.send(BotEvent::AuctionListed {
+                    item_name: item,
+                    starting_bid: bid,
+                    duration_hours: dur,
+                });
+            }
+        } else if clean_message.contains("This BIN sale is still in its grace period!") {
+            // Hypixel rejected the buy click because the BIN is in its grace period,
+            // but slot 31 already shows gold_nugget (not a bed).  Keep clicking every
+            // 100 ms until the Confirm Purchase window opens — matches
+            // AutoBuy.initBedSpam() which clicks whenever slotName === "gold_nugget".
+            if *state.bot_state.read() == BotState::Purchasing {
+                let already_active = state.grace_period_spam_active.swap(true, Ordering::Relaxed);
+                if !already_active {
+                    let bot_clone = bot.clone();
+                    let window_id = *state.last_window_id.read();
+                    let shared_window_id = state.last_window_id.clone();
+                    let bot_state = state.bot_state.clone();
+                    let spam_flag = state.grace_period_spam_active.clone();
+                    let click_interval_ms = state.bed_spam_click_delay.max(1);
+                    info!("[AH] Grace period detected — starting bed spam ({} ms interval)", click_interval_ms);
+                    tokio::spawn(async move {
+                        const MAX_FAILED_CLICKS: usize = 5;
+                        let mut failed_clicks: usize = 0;
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
+                            let current_window_id = *shared_window_id.read();
+                            if current_window_id != window_id {
+                                info!(
+                                    "[AH] Grace period spam: window changed ({} -> {}), stopping",
+                                    window_id, current_window_id
+                                );
+                                break;
+                            }
+                            let current_kind = {
+                                let menu = bot_clone.menu();
+                                let slots = menu.slots();
+                                slots.get(31).map(|s| {
+                                    if s.is_empty() { "air".to_string() }
+                                    else { s.kind().to_string().to_lowercase() }
+                                }).unwrap_or_else(|| "air".to_string())
+                            };
+                            if current_kind.contains("air") {
+                                info!("[AH] Grace period spam: window closed");
+                                *bot_state.write() = BotState::Idle;
+                                break;
+                            } else if current_kind.contains("gold_nugget") {
+                                // Grace period may still be active — keep clicking.
+                                // Reset failed counter: slot is correct, just waiting.
+                                failed_clicks = 0;
+                                click_window_slot(&bot_clone, &shared_window_id, window_id, 31).await;
+                            } else {
+                                failed_clicks += 1;
+                                debug!("[AH] Grace period spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                                if failed_clicks >= MAX_FAILED_CLICKS {
+                                    warn!("[AH] Grace period spam stopped after {} failed clicks", failed_clicks);
+                                    *bot_state.write() = BotState::Idle;
+                                    break;
+                                }
+                            }
+                        }
+                        spam_flag.store(false, Ordering::Relaxed);
+                    });
+                }
+            }
+        }
+
+        // Detect bazaar order limit ("You reached your maximum of XY Bazaar orders!")
+        // and clear it when an order fills ("Claimed ... coins from ...").
+        if clean_message.contains("You reached your maximum of") && clean_message.contains("Bazaar orders") {
+            warn!("[Bazaar] Order limit reached — pausing bazaar flips until a slot frees up");
+            state.bazaar.at_limit.store(true, Ordering::Relaxed);
+        } else if clean_message.contains("[Bazaar]") && (clean_message.contains("coins from selling") || clean_message.contains("coins from buying")) {
+            // An order was collected — a slot is now free
+            if state.bazaar.at_limit.load(Ordering::Relaxed) {
+                info!("[Bazaar] Order collected, clearing order-limit flag");
+                state.bazaar.at_limit.store(false, Ordering::Relaxed);
+            }
+        }
+
+        // Detect bazaar daily sell value limit
+        if clean_message.contains("You reached the daily limit") && clean_message.contains("bazaar") {
+            warn!("[Bazaar] Daily sell value limit reached — pausing bazaar flips until 0:00 UTC");
+            state.bazaar.daily_limit.store(true, Ordering::Relaxed);
+        }
+
+        // Detect bazaar order rejection ("Your price isn't competitive enough")
+        // so the confirm handler knows not to emit BazaarOrderPlaced.
+        if clean_message.contains("[Bazaar]") && clean_message.contains("Your price isn't competitive enough") {
+            warn!("[Bazaar] Order rejected — price not competitive");
+            state.bazaar.order_rejected.store(true, Ordering::Relaxed);
+        }
+
+        // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
+        // ManageOrders run so the filled items are collected promptly.
+        if let Some((filled_item, is_buy)) = parse_bazaar_filled_notification(&clean_message) {
+            info!("[BazaarOrders] Order fill notification — {} \"{}\"", if is_buy { "BUY" } else { "SELL" }, filled_item);
+            let _ = state.event_tx.send(BotEvent::BazaarOrderFilled {
+                item_name: filled_item,
+                is_buy_order: is_buy,
+            });
+        }
+
+        // Detect "You don't have the space required to claim that!" and set the
+        // inventory_full flag so ManageOrders can stop and log remaining orders.
+        if clean_message.contains("don't have the space required to claim") {
+            warn!("[ManageOrders] Inventory full — logging unclaimed orders");
+            state.inventory_full.store(true, Ordering::Relaxed);
+        }
+
+        // Detect "You have X item(s) stashed away!" — Hypixel sends this both
+        // when items are newly stashed AND as a periodic reminder while any
+        // stashed items exist.  Only set inventory_full if the player
+        // inventory actually has very few free slots (≤ 2), because the
+        // reminder keeps firing long after the player frees space via
+        // instasell or other means.
+        if clean_message.contains("stashed away") {
+            let empty = count_empty_player_slots(&bot);
+            if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
+                warn!("[ManageOrders] Items stashed and inventory nearly full ({} empty slots)", empty);
+                state.inventory_full.store(true, Ordering::Relaxed);
+            } else {
+                debug!("[ManageOrders] Stashed-away reminder ignored — inventory has {} empty slots", empty);
+            }
+        }
+
+        // Detect "Inventory full? Don't forget to check out your Storage
+        // inside the SkyBlock Menu!" — Hypixel sends this frequently when
+        // the player's inventory is full.  Only set the flag when inventory
+        // truly has very few free slots, in case the message arrives after
+        // the player freed space (e.g. via manual instasell).
+        if clean_message.contains("Inventory full?") {
+            let empty = count_empty_player_slots(&bot);
+            if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
+                warn!("[ManageOrders] Inventory full hint detected ({} empty slots)", empty);
+                state.inventory_full.store(true, Ordering::Relaxed);
+            } else {
+                debug!("[ManageOrders] Inventory-full hint ignored — inventory has {} empty slots", empty);
+            }
+        }
+
+        // Detect "You don't have anything to sell!" during SellingInventoryBz
+        // — Hypixel sends this when inventory has no instasellable items.
+        if clean_message.contains("don't have anything to sell")
+            && *state.bot_state.read() == BotState::SellingInventoryBz
+        {
+            info!("[SellInventoryBz] Nothing to sell — closing window and going idle");
+            *state.bazaar.sell_inventory_step.write() = SellInventoryStep::Initial;
+            let wid = *state.last_window_id.read();
+            if wid > 0 {
+                send_raw_close(&bot, wid, &state.handlers);
+            }
+            *state.bot_state.write() = BotState::Idle;
+        }
+
+        // Check if we've teleported to island yet
+        let teleported = *state.teleported_to_island.read();
+        let join_time = *state.skyblock_join_time.read();
+        
+        // Look for messages indicating we're in SkyBlock and should go to island
+        if let Some(join_time) = join_time {
+            if !teleported {
+                // Check for timeout (if we've been waiting too long, try anyway)
+                let should_timeout = join_time.elapsed() > tokio::time::Duration::from_secs(SKYBLOCK_JOIN_TIMEOUT_SECS);
+                
+                // Check if message is a SkyBlock join confirmation
+                let skyblock_detected = {
+                    if clean_message.starts_with("Welcome to Hypixel SkyBlock") {
+                        true
+                    }
+                    else if clean_message.starts_with("[Profile]") && clean_message.contains("currently") {
+                        true
+                    }
+                    else if clean_message.starts_with("[") {
+                        let upper = clean_message.to_uppercase();
+                        upper.contains("SKYBLOCK") && upper.contains("PROFILE")
+                    } else {
+                        false
+                    }
+                };
+                
+                if skyblock_detected || should_timeout {
+                    // Mark as joined now that we've confirmed
+                    *state.joined_skyblock.write() = true;
+                    *state.teleported_to_island.write() = true;
+                    
+                    if should_timeout {
+                        info!("Timeout waiting for SkyBlock confirmation - attempting to teleport to island anyway...");
+                    } else {
+                        info!("Detected SkyBlock join - teleporting to island...");
+                    }
+                    
+                    // Spawn a task to handle teleportation and startup workflow (non-blocking)
+                    let bot_clone = bot.clone();
+                    let bot_state = state.bot_state.clone();
+                    let event_tx_startup = state.event_tx.clone();
+                    let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
+                    let auto_cookie_startup = state.auto_cookie_hours.clone();
+                    let command_queue_startup = state.command_queue.clone();
+                    let startup_in_progress_startup = state.startup_in_progress.clone();
+                    let enable_bazaar_flips_startup = state.enable_bazaar_flips.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
+                        send_chat_command(&bot_clone, "/is");
+                        
+                        // Wait for teleport to complete
+                        tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
+
+                        run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_queue_startup, startup_in_progress_startup, enable_bazaar_flips_startup).await;
+                    });
+                }
+            }
+        }
+}
+
+async fn handle_event_packet(
+    bot: &Client,
+    state: &BotClientState,
+    packet: std::sync::Arc<azalea_protocol::packets::game::ClientboundGamePacket>,
+) {
+        // Handle specific packets for window open/close and inventory updates
+        match packet.as_ref() {
+            ClientboundGamePacket::OpenScreen(open_screen) => {
+                // Record the instant the OpenScreen packet reaches our
+                // event handler via the Event::Packet channel pipeline.
+                let event_handler_at = std::time::Instant::now();
+
+                // If a purchase is in-flight, compare the ECS observer timestamp
+                // (set by PacketAcceleratorPlugin during apply_deferred) with the
+                // Event::Packet handler timestamp to measure pipeline overhead.
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    // Read the observer timestamp, dropping the lock immediately.
+                    let observer_ts = state.window_open_info.read()
+                        .as_ref()
+                        .map(|info| info.timestamp);
+                    if let Some(obs_ts) = observer_ts {
+                        let observer_ms = obs_ts.duration_since(t0).as_secs_f64() * 1000.0;
+                        let pipeline_ms = event_handler_at
+                            .duration_since(obs_ts)
+                            .as_secs_f64() * 1000.0;
+                        info!(
+                            "[Timing] /viewauction → window: ECS observer {:.1}ms, \
+                             Event::Packet handler {:.1}ms (+{:.1}ms pipeline overhead)",
+                            observer_ms, total_ms, pipeline_ms
+                        );
+                    } else {
+                        info!(
+                            "[Timing] /viewauction → OpenScreen handler: {:.1}ms \
+                             (ECS observer did not fire — check PacketAcceleratorPlugin)",
+                            total_ms
+                        );
+                    }
+                }
+
+                let window_id = open_screen.container_id;
+                let window_type = format!("{:?}", open_screen.menu_type);
+                let title = open_screen.title.to_string();
+                
+                // Parse the title from JSON format
+                let parsed_title = state.handlers.parse_window_title(&title);
+                
+                // Store window ID
+                *state.last_window_id.write() = window_id as u8;
+                
+                state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
+
+                // Log the synchronous overhead of the OpenScreen handler
+                // itself (title parsing + state writes + logging).  This
+                // should be <1 ms; if it is significantly higher, a lock
+                // contention problem exists.
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    let handler_ms = event_handler_at.elapsed().as_secs_f64() * 1000.0;
+                    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    info!(
+                        "[Timing] OpenScreen handler overhead: {:.2}ms \
+                         (total since /viewauction: {:.1}ms)",
+                        handler_ms, total_ms
+                    );
+                }
+                // Defer the (expensive) window-JSON rebuild so the event
+                // handler returns faster.  On the purchase path this is
+                // critical: ContainerSetContent may arrive in the very next
+                // packet frame and its handler must fire
+                // slot_data_notify.notify_waiters() without waiting for the
+                // JSON rebuild to finish.
+                {
+                    let cache_bot = bot.clone();
+                    let cache_state = state.clone();
+                    tokio::spawn(async move {
+                        rebuild_cached_window_json(&cache_bot, &cache_state);
+                    });
+                }
+                if state.event_tx.send(BotEvent::WindowOpen(window_id as u8, window_type.clone(), parsed_title.clone())).is_err() {
+                    debug!("Failed to send WindowOpen event - receiver dropped");
+                }
+
+                // Spawn a 5-second watchdog: if this window is still open in an
+                // interactive bot state after 5 s it is considered stuck and is
+                // closed automatically.  Matches user requirement "guis should
+                // autoclose if not used for over 5 seconds".
+                // Exception: bed (grace-period) timing — the BIN Auction View must
+                // stay open for up to 60 s while waiting for the grace period to end.
+                // Also skips if a newer command started since this window was opened
+                // (prevents a stale watchdog from interrupting a new command).
+                {
+                    let wdog_bot   = bot.clone();
+                    let wdog_wid   = window_id as u8;
+                    let wdog_state = state.bot_state.clone();
+                    let wdog_last  = state.last_window_id.clone();
+                    let wdog_spam  = state.grace_period_spam_active.clone();
+                    let wdog_bed   = state.bed_timing_active.clone();
+                    let wdog_gen   = state.command_generation.clone();
+                    let wdog_gen_at_open = state.command_generation.load(Ordering::SeqCst);
+                    let wdog_deadline = state.bazaar.manage_orders_deadline.clone();
+                    let wdog_bz_limit = state.bazaar.at_limit.clone();
+                    let wdog_handlers = state.handlers.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        let still_open  = *wdog_last.read() == wdog_wid;
+                        let cur_state   = *wdog_state.read();
+                        let is_bed      = wdog_bed.load(Ordering::Relaxed);
+                        let is_interactive = matches!(cur_state,
+                            BotState::Purchasing | BotState::Bazaar | BotState::Selling
+                            | BotState::ClaimingPurchased | BotState::ClaimingSold
+                            | BotState::InstaSelling
+                            | BotState::CancellingAuction | BotState::SellingInventoryBz
+                            | BotState::ManagingOrders
+                        );
+                        // Only fire if no new command started since this window was opened.
+                        let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
+                        if still_open && is_interactive && !is_bed && gen_unchanged {
+                            warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
+                            send_raw_close(&wdog_bot, wdog_wid, &wdog_handlers);
+                            // Clean up ManagingOrders-specific state so the bot
+                            // doesn't remain stuck with a stale deadline or the
+                            // bazaar order-limit flag blocking new flips.
+                            if cur_state == BotState::ManagingOrders {
+                                *wdog_deadline.write() = None;
+                                wdog_bz_limit.store(false, Ordering::Relaxed);
+                            }
+                            *wdog_state.write() = BotState::Idle;
+                            wdog_spam.store(false, Ordering::Relaxed);
+                        }
+                    });
+                }
+
+                // Handle window interactions in a spawned task so this event
+                // handler returns immediately.  This is critical for the
+                // purchase flow: if ContainerSetContent arrives in a
+                // separate packet frame, its handler must be able to fire
+                // slot_data_notify.notify_waiters() without waiting for the
+                // OpenScreen handler to finish.
+                {
+                    let bot_s = bot.clone();
+                    let state_s = state.clone();
+                    let title_s = parsed_title.clone();
+                    tokio::spawn(async move {
+                        let result = std::panic::AssertUnwindSafe(
+                            handle_window_interaction(&bot_s, &state_s, window_id as u8, &title_s)
+                        );
+                        if let Err(e) = futures::FutureExt::catch_unwind(result).await {
+                            error!("[WindowHandler] panic in handle_window_interaction: {:?}", e);
+                        }
+                    });
+                }
+            }
+            
+            ClientboundGamePacket::ContainerClose(_) => {
+                // Clear grace-period spam and bed-timing flags so a new BIN Auction View
+                // can start fresh.
+                state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                *state.pending_purchase_at_ms.write() = None;
+                state.bed_timing_active.store(false, Ordering::Relaxed);
+                state.handlers.handle_window_close().await;
+                // Defer the window-JSON rebuild so the event handler returns
+                // quickly.  bot.menu() briefly locks the ECS World mutex; doing
+                // the full NBT-extraction + JSON-serialisation synchronously
+                // keeps that contention window open and delays the next ECS
+                // schedule cycle, contributing to slow frames.
+                {
+                    let bot_close = bot.clone();
+                    let state_close = state.clone();
+                    tokio::spawn(async move {
+                        rebuild_cached_window_json(&bot_close, &state_close);
+                    });
+                }
+                if state.event_tx.send(BotEvent::WindowClose).is_err() {
+                    debug!("Failed to send WindowClose event - receiver dropped");
+                }
+            }
+            
+            ClientboundGamePacket::ContainerSetSlot(_slot_update) => {
+                // Wake the purchase handler FIRST so it can react to slot 31
+                // data on another thread without waiting for the inventory
+                // JSON rebuild.
+                state.slot_data_notify.notify_waiters();
+                // Debounce the inventory-JSON rebuild: individual slot updates
+                // can fire dozens of times per GUI interaction.  Each call locks
+                // the ECS World mutex (via bot.menu()) and serialises all
+                // inventory slots to JSON.  Coalescing into a single rebuild
+                // after the debounce window dramatically reduces both CPU usage
+                // and World-lock contention that causes slow ECS frames.
+                if !state.inventory_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
+                    let bot_inv = bot.clone();
+                    let state_inv = state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(INVENTORY_CACHE_REBUILD_DEBOUNCE_MS)).await;
+                        rebuild_cached_inventory_json(&bot_inv, &state_inv);
+                        state_inv.inventory_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
+                    });
+                }
+                // Debounce the window-JSON rebuild: individual slot updates can fire
+                // dozens of times per GUI interaction.  Coalesce them into a single
+                // rebuild after the debounce window to avoid excessive CPU from
+                // repeated NBT extraction + JSON serialisation.
+                if !state.window_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
+                    let bot_clone = bot.clone();
+                    let state_clone = state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CACHE_REBUILD_DEBOUNCE_MS)).await;
+                        rebuild_cached_window_json(&bot_clone, &state_clone);
+                        state_clone.window_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
+                    });
+                }
+            }
+            
+            ClientboundGamePacket::ContainerSetContent(_content) => {
+                // Log when ContainerSetContent arrives during a purchase
+                // flow — this populates slot 31 and unblocks the buy-click.
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    if *state.bot_state.read() == BotState::Purchasing {
+                        info!(
+                            "[Timing] /viewauction → ContainerSetContent: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                }
+                // Wake the purchase handler FIRST so it can react to slot 31
+                // data on another thread without waiting for the inventory
+                // JSON rebuild.
+                state.slot_data_notify.notify_waiters();
+                // Defer both JSON rebuilds so the event handler returns quickly.
+                // Each rebuild calls bot.menu() which briefly locks the ECS World
+                // mutex; running them synchronously keeps the handler blocked for
+                // 20-50 ms of NBT extraction + JSON serialisation, starving
+                // subsequent event processing and increasing World-lock contention
+                // with the ECS schedule loop (causing slow frames).
+                {
+                    let bot_inv = bot.clone();
+                    let state_inv = state.clone();
+                    tokio::spawn(async move {
+                        rebuild_cached_inventory_json(&bot_inv, &state_inv);
+                    });
+                }
+                {
+                    let bot_win = bot.clone();
+                    let state_win = state.clone();
+                    tokio::spawn(async move {
+                        rebuild_cached_window_json(&bot_win, &state_win);
+                    });
+                }
+            }
+
+            ClientboundGamePacket::OpenSignEditor(pkt) => {
+                // Hypixel sends this when the bot clicks "Custom Amount", "Custom Price"
+                // (bazaar), slot 31 (auction price), or slot 16 in "Auction Duration".
+                // We respond immediately with ServerboundSignUpdate to write the value
+                // (matching TypeScript's bot._client.once('open_sign_entity')).
+                let bot_state = *state.bot_state.read();
+                if bot_state == BotState::Bazaar {
+                    let step = *state.bazaar.step.read();
+                    let pos = pkt.pos;
+                    let is_front = pkt.is_front_text;
+
+                    let text_to_write = match step {
+                        BazaarStep::SetAmount => {
+                            let amount = *state.bazaar.amount.read();
+                            info!("[Bazaar] Sign opened for amount — writing: {}", amount);
+                            amount.to_string()
+                        }
+                        BazaarStep::SetPrice => {
+                            let price = *state.bazaar.price_per_unit.read();
+                            let s = format_price_for_sign(price);
+                            info!("[Bazaar] Sign opened for price — writing: {}", s);
+                            s
+                        }
+                        BazaarStep::SelectOrderType => {
+                            // Hypixel opened a sign directly after clicking "Create Sell/Buy Order"
+                            // (direct-sign flow — no intermediate "Custom Price" GUI button).
+                            // Treat this as the price sign (matching TypeScript behaviour where
+                            // sell offers go straight to the price sign).
+                            let price = *state.bazaar.price_per_unit.read();
+                            let s = format_price_for_sign(price);
+                            info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", s);
+                            *state.bazaar.step.write() = BazaarStep::SetPrice;
+                            s
+                        }
+                        _ => {
+                            warn!("[Bazaar] Unexpected sign opened at step {:?}", step);
+                            return;
+                        }
+                    };
+
+                    // Sign format exactly matching TypeScript bazaarFlipHandler.ts:
+                    // text1: the value (price or amount as plain string)
+                    // text2: "^^^^^^^^^^^^^^^" hint arrows (from JSON extra["^^^^^^^^^^^^^^^"])
+                    // text3, text4: empty
+                    let packet = ServerboundSignUpdate {
+                        pos,
+                        is_front_text: is_front,
+                        lines: [
+                            text_to_write,
+                            "^^^^^^^^^^^^^^^".to_string(),
+                            String::new(),
+                            String::new(),
+                        ],
+                    };
+                    bot.write_packet(packet);
+                } else if bot_state == BotState::Selling {
+                    // Auction sign handler — matches TypeScript's setAuctionDuration and
+                    // bot._client.once('open_sign_entity') for price in sellHandler.ts
+                    if state.auction.sell_aborted.load(Ordering::Relaxed) {
+                        warn!("[Auction] Sign opened but auction sell aborted — skipping");
+                        return;
+                    }
+                    let step = *state.auction.step.read();
+                    let pos = pkt.pos;
+                    let is_front = pkt.is_front_text;
+
+                    let (text_to_write, next_step) = match step {
+                        AuctionStep::PriceSign => {
+                            let price = *state.auction.starting_bid.read();
+                            info!("[Auction] Sign opened for price — writing: {}", price);
+                            (price.to_string(), AuctionStep::SetDuration)
+                        }
+                        AuctionStep::DurationSign => {
+                            let hours = *state.auction.duration_hours.read();
+                            info!("[Auction] Sign opened for duration — writing: {} hours", hours);
+                            (hours.to_string(), AuctionStep::ConfirmSell)
+                        }
+                        _ => {
+                            warn!("[Auction] Unexpected sign opened at step {:?}", step);
+                            return;
+                        }
+                    };
+
+                    *state.auction.step.write() = next_step;
+                    let packet = ServerboundSignUpdate {
+                        pos,
+                        is_front_text: is_front,
+                        lines: [
+                            text_to_write,
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                        ],
+                    };
+                    bot.write_packet(packet);
+                }
+            }
+
+            // ---- Scoreboard packets ----
+            // Track scoreboard data from Hypixel SkyBlock sidebar.
+            // The sidebar contains player purse, stats, etc. which COFL uses
+            // to validate flip eligibility (e.g. purse check before buying).
+
+            ClientboundGamePacket::SetDisplayObjective(pkt) => {
+                // Slot 1 = sidebar
+                if matches!(pkt.slot, DisplaySlot::Sidebar) {
+                    *state.sidebar_objective.write() = Some(pkt.objective_name.clone());
+                    debug!("[Scoreboard] Sidebar objective set to: {}", pkt.objective_name);
+                }
+            }
+
+            ClientboundGamePacket::SetScore(pkt) => {
+                // Store score entry: objective -> owner -> (display, score)
+                // Hypixel SkyBlock encodes sidebar text in the owner field;
+                // the optional display override is absent for most entries.
+                let display_text = pkt.display
+                    .as_ref()
+                    .and_then(|d| { let s = d.to_string(); if s.is_empty() { None } else { Some(s) } })
+                    .unwrap_or_else(|| pkt.owner.clone());
+                state.scoreboard_scores
+                    .write()
+                    .entry(pkt.objective_name.clone())
+                    .or_default()
+                    .insert(pkt.owner.clone(), (display_text, pkt.score));
+            }
+
+            ClientboundGamePacket::ResetScore(pkt) => {
+                // Remove a score entry
+                let mut scores = state.scoreboard_scores.write();
+                if let Some(obj_name) = &pkt.objective_name {
+                    if let Some(objective) = scores.get_mut(obj_name.as_str()) {
+                        objective.remove(&pkt.owner);
+                    }
+                } else {
+                    // Remove from all objectives
+                    for objective in scores.values_mut() {
+                        objective.remove(&pkt.owner);
+                    }
+                }
+            }
+
+            ClientboundGamePacket::SetPlayerTeam(pkt) => {
+                // Track team prefix/suffix for scoreboard display.
+                // Hypixel SkyBlock uses team-based encoding: the team prefix
+                // contains the actual visible text; the score entry owner (e.g. §y)
+                // is used only as a unique identifier.
+                let mut teams = state.scoreboard_teams.write();
+                match &pkt.method {
+                    TeamMethod::Add((params, members)) => {
+                        let prefix = params.player_prefix.to_string();
+                        let suffix = params.player_suffix.to_string();
+                        teams.insert(pkt.name.clone(), (prefix, suffix, members.clone()));
+                    }
+                    TeamMethod::Remove => {
+                        teams.remove(&pkt.name);
+                    }
+                    TeamMethod::Change(params) => {
+                        let prefix = params.player_prefix.to_string();
+                        let suffix = params.player_suffix.to_string();
+                        let (entry_prefix, entry_suffix, _) = teams
+                            .entry(pkt.name.clone())
+                            .or_insert_with(|| (String::new(), String::new(), Vec::new()));
+                        *entry_prefix = prefix;
+                        *entry_suffix = suffix;
+                    }
+                    TeamMethod::Join(members) => {
+                        let (_, _, entry_members) = teams
+                            .entry(pkt.name.clone())
+                            .or_insert_with(|| (String::new(), String::new(), Vec::new()));
+                        entry_members.extend(members.clone());
+                    }
+                    TeamMethod::Leave(members) => {
+                        if let Some((_, _, entry_members)) = teams.get_mut(&pkt.name) {
+                            let leaving: std::collections::HashSet<&String> = members.iter().collect();
+                            entry_members.retain(|m| !leaving.contains(m));
+                        }
+                    }
+                }
+            }
+            
+            _ => {}
+        }
+}
+
+async fn handle_event_disconnect(
+    _bot: &Client,
+    state: &BotClientState,
+    reason: Option<azalea_chat::FormattedText>,
+) {
+        info!("Bot disconnected: {:?}", reason);
+        let reason_str = format!("{:?}", reason);
+        if state.event_tx.send(BotEvent::Disconnected(reason_str)).is_err() {
+            debug!("Failed to send Disconnected event - receiver dropped");
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
