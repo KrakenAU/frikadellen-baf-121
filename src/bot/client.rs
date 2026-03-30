@@ -26,6 +26,7 @@ use tracing::{info, error, debug, warn};
 use crate::types::{BotState, QueuedCommand};
 use crate::state::CommandQueue;
 use crate::websocket::CoflWebSocket;
+use crate::bot::state::{BazaarCtx, AuctionCtx};
 use super::handlers::BotEventHandlers;
 
 /// Connection wait duration (seconds) - time to wait for bot connection to establish
@@ -249,103 +250,38 @@ fn on_container_set_content(
 /// - Azalea examples: https://github.com/azalea-rs/azalea/tree/main/azalea/examples
 #[derive(Clone)]
 pub struct BotClient {
-    /// Current bot state
     state: Arc<RwLock<BotState>>,
-    /// Action counter for window clicks (anti-cheat)
     action_counter: Arc<RwLock<i16>>,
-    /// Last window ID seen
     last_window_id: Arc<RwLock<u8>>,
-    /// Event handlers
     handlers: Arc<BotEventHandlers>,
-    /// Event sender channel
     event_tx: mpsc::UnboundedSender<BotEvent>,
-    /// Event receiver channel (cloned for each listener)
     event_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<BotEvent>>>,
-    /// Command sender channel (for sending commands to the bot)
     command_tx: mpsc::UnboundedSender<QueuedCommand>,
-    /// Command receiver channel (for the event handler to receive commands)
     command_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<QueuedCommand>>>,
-    /// Scoreboard scores shared with BotClientState: objective_name -> (owner -> (display_text, score))
     scoreboard_scores: Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>,
-    /// Which objective is displayed in the sidebar slot (shared with BotClientState)
     sidebar_objective: Arc<RwLock<Option<String>>>,
-    /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
-    /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
-    /// Set when "You reached your maximum of XY Bazaar orders!" is received.
-    /// Cleared when an order fills (Claimed message detected).
-    bazaar_at_limit: Arc<AtomicBool>,
-    /// Set when "[Bazaar] You reached the daily limit" is detected.
-    /// Cleared on account switch or at 0:00 UTC daily reset.
-    bazaar_daily_limit: Arc<AtomicBool>,
-    /// Set when "Maximum auction count reached" is detected in the Manage Auctions GUI.
-    /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
-    /// SellToAuction → /ah → limit-detected → idle loops.
-    auction_at_limit: Arc<AtomicBool>,
-    /// Set when the server rejects an order placement (e.g. "Your price isn't
-    /// competitive enough").  Cleared before each confirm-click so only the
-    /// response to the *current* placement attempt is captured.
-    bazaar_order_rejected: Arc<AtomicBool>,
-    /// Cached player-inventory JSON (serialised Window object).
-    /// Updated on every ContainerSetContent / ContainerSetSlot for the player
-    /// inventory window (id 0) so that getInventory can be answered instantly,
-    /// in parallel with any ongoing Hypixel interaction — matching TypeScript
-    /// BAF.ts which calls `JSON.stringify(bot.inventory)` directly without
-    /// waiting for a command-queue slot.
     cached_inventory_json: Arc<RwLock<Option<String>>>,
-    /// AUTO_COOKIE config value passed through to BotClientState.
     auto_cookie_hours: Arc<RwLock<u64>>,
-    /// Hidden config gate for purchaseAt bed timing mode.
     pub freemoney: bool,
-    /// Enable fast-buy: skip-click on predicted Confirm Purchase window.
     pub fastbuy: bool,
-    /// Interval in milliseconds for grace-period bed/gold_nugget click loops.
     pub bed_spam_click_delay: u64,
-    /// Item name to sell via bazaar "Sell Instantly" when inventory is full
-    insta_sell_item: Arc<RwLock<Option<String>>>,
-    /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
-    /// Items the bot has listed on the AH (by lowercase item name).
-    /// Used to filter out coop member sales from our own sales.
-    active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
-    /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
-    /// When true, the ManagingOrders handler also cancels open orders (startup mode).
-    manage_orders_cancel_open: Arc<AtomicBool>,
-    /// Cancel open bazaar orders when they are older than this many minutes per million coins.
-    /// 0 disables age-based cancellation in periodic ManageOrders runs.
-    pub bazaar_order_cancel_minutes_per_million: u64,
-    /// Updated whenever the bot opens the Manage/My Auctions GUI.
-    cached_my_auctions_json: Arc<RwLock<Option<String>>>,
-    /// Time when /viewauction was sent — start of buy-speed measurement.
-    /// Shared with `BotClientState` so the event handler can compute elapsed time
-    /// when "Putting coins in escrow" arrives.
-    purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
-    /// Shared AH-pause flag so ManageOrders can self-abort when AH flips are incoming.
     pub bazaar_flips_paused: Arc<AtomicBool>,
-    /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
-    /// Drained periodically and sent as `{"type":"chatBatch","data":"[...]"}`.
     pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
-    /// Cached GUI window JSON for the web panel game view.
     cached_window_json: Arc<RwLock<Option<String>>>,
-    /// Set when inventory is full (stashed items / no space to claim).
-    /// Shared with `BotClientState` so `main.rs` can check before enqueuing ManageOrders.
     inventory_full: Arc<AtomicBool>,
-    /// Cached count of empty player inventory slots (shared with BotClientState).
-    /// Updated on every inventory rebuild.
     cached_empty_player_slots: Arc<std::sync::atomic::AtomicU8>,
-    /// Shared reference to the command queue so the startup workflow can enqueue
-    /// commands (CheckCookie, ManageOrders, ClaimSoldItem, ClaimPurchasedItem)
-    /// through the proper queue instead of directly driving bot state.
     command_queue: Arc<RwLock<Option<CommandQueue>>>,
-    /// Set to true while the startup workflow is running. Checked by flip handlers
-    /// to block bazaar flips during startup (since bot state cycles through
-    /// Idle between queued startup commands).
     startup_in_progress: Arc<AtomicBool>,
-    /// Whether bazaar flips are enabled in the config.  Used by the startup
-    /// workflow to decide whether to cancel all open bazaar orders.
     pub enable_bazaar_flips: Arc<AtomicBool>,
+    purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Bazaar-specific state shared between BotClient and BotClientState.
+    pub bazaar: BazaarCtx,
+    /// Auction-specific state shared between BotClient and BotClientState.
+    pub auction: AuctionCtx,
 }
 #[derive(Debug, Clone)]
 pub enum BotEvent {
@@ -443,23 +379,13 @@ impl BotClient {
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
-            bazaar_at_limit: Arc::new(AtomicBool::new(false)),
-            bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
-            auction_at_limit: Arc::new(AtomicBool::new(false)),
-            bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             freemoney: false,
             fastbuy: false,
             bed_spam_click_delay: 100,
-            insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
-            active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
-            manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
-            bazaar_order_cancel_minutes_per_million: 5,
-            cached_my_auctions_json: Arc::new(RwLock::new(None)),
-            purchase_start_time: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
@@ -468,6 +394,9 @@ impl BotClient {
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
+            purchase_start_time: Arc::new(RwLock::new(None)),
+            bazaar: BazaarCtx::new(5),
+            auction: AuctionCtx::new(),
         }
     }
 
@@ -525,27 +454,12 @@ impl BotClient {
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
             claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
-            bazaar_item_name: Arc::new(RwLock::new(String::new())),
-            bazaar_amount: Arc::new(RwLock::new(0)),
-            bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
-            bazaar_is_buy_order: Arc::new(RwLock::new(true)),
-            bazaar_step: Arc::new(RwLock::new(BazaarStep::Initial)),
-            auction_item_name: Arc::new(RwLock::new(String::new())),
-            auction_starting_bid: Arc::new(RwLock::new(0)),
-            auction_duration_hours: Arc::new(RwLock::new(24)),
-            auction_item_slot: Arc::new(RwLock::new(None)),
-            auction_item_id: Arc::new(RwLock::new(None)),
-            auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
-            auction_sell_aborted: Arc::new(AtomicBool::new(false)),
-            auction_stuck_item_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            bazaar: self.bazaar.clone_arcs(),
+            auction: self.auction.clone_arcs(),
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
-            bazaar_at_limit: self.bazaar_at_limit.clone(),
-            bazaar_daily_limit: self.bazaar_daily_limit.clone(),
-            auction_at_limit: self.auction_at_limit.clone(),
-            bazaar_order_rejected: self.bazaar_order_rejected.clone(),
             purchase_start_time: self.purchase_start_time.clone(),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -565,18 +479,8 @@ impl BotClient {
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: self.inventory_full.clone(),
             cached_empty_player_slots: self.cached_empty_player_slots.clone(),
-            insta_sell_item: self.insta_sell_item.clone(),
             bed_pre_click_ms: self.bed_pre_click_ms,
-            active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
-            manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
-            bazaar_order_cancel_minutes_per_million: self.bazaar_order_cancel_minutes_per_million,
-            managing_order_context: Arc::new(RwLock::new(None)),
-            cached_my_auctions_json: self.cached_my_auctions_json.clone(),
-            manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
-            cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
-            cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
-            manage_orders_deadline: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: self.bazaar_flips_paused.clone(),
             chat_batch_buffer: self.chat_batch_buffer.clone(),
             cached_window_json: self.cached_window_json.clone(),
@@ -585,7 +489,6 @@ impl BotClient {
             command_queue: self.command_queue.clone(),
             startup_in_progress: self.startup_in_progress.clone(),
             enable_bazaar_flips: self.enable_bazaar_flips.clone(),
-            order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -771,28 +674,28 @@ impl BotClient {
     /// Manage Auctions GUI. Returns `None` if the bot has not opened the
     /// My Auctions window yet.
     pub fn get_cached_my_auctions_json(&self) -> Option<String> {
-        self.cached_my_auctions_json.read().clone()
+        self.auction.cached_my_auctions_json.read().clone()
     }
 
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
     pub fn is_bazaar_at_limit(&self) -> bool {
-        self.bazaar_at_limit.load(Ordering::Relaxed)
+        self.bazaar.at_limit.load(Ordering::Relaxed)
     }
 
     /// Returns true if the bazaar daily sell value limit has been hit.
     pub fn is_bazaar_daily_limit(&self) -> bool {
-        self.bazaar_daily_limit.load(Ordering::Relaxed)
+        self.bazaar.daily_limit.load(Ordering::Relaxed)
     }
 
     /// Clears the bazaar daily sell value limit flag (e.g. at 0:00 UTC reset).
     pub fn clear_bazaar_daily_limit(&self) {
-        self.bazaar_daily_limit.store(false, Ordering::Relaxed);
+        self.bazaar.daily_limit.store(false, Ordering::Relaxed);
     }
 
     /// Returns true if the auction house limit has been hit and not yet cleared.
     /// Used by `main.rs` to skip SellToAuction commands when at the cap.
     pub fn is_auction_at_limit(&self) -> bool {
-        self.auction_at_limit.load(Ordering::Relaxed)
+        self.auction.at_limit.load(Ordering::Relaxed)
     }
 
     /// Returns true if inventory is full (items stashed / no space to claim).
@@ -973,6 +876,24 @@ pub enum BazaarStep {
     Confirm,
 }
 
+/// Steps for the InstaSelling flow (separate from bazaar order placement).
+/// BotState::InstaSelling uses this instead of reusing BazaarStep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstaSellStep {
+    #[default]
+    FindItem,       // /bz opened — searching for the item in results
+    FindSellButton, // On item detail page — looking for "Sell Instantly"
+    WaitConfirm,    // On confirmation/warning page — waiting for "Confirm" button
+}
+
+/// Steps for the SellingInventoryBz flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SellInventoryStep {
+    #[default]
+    Initial,       // Bazaar main page — clicking "Sell Inventory Now"
+    ConfirmWindow, // Confirmation page — clicking slot 11 to sell
+}
+
 /// Sub-steps within the BuyingCookie state.
 /// Matches TypeScript cookieHandler.ts buyCookie() flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1010,38 +931,9 @@ pub struct BotClientState {
     /// Queue of sold-auction UUIDs extracted from chat clickEvent (/viewauction <uuid>).
     /// Keeps claim order stable when multiple auctions sell close together.
     pub claim_sold_uuid_queue: Arc<RwLock<VecDeque<String>>>,
-    // ---- Bazaar order context (set in execute_command, read in window/sign handlers) ----
-    /// Item name for current bazaar order
-    pub bazaar_item_name: Arc<RwLock<String>>,
-    /// Amount for current bazaar order
-    pub bazaar_amount: Arc<RwLock<u64>>,
-    /// Price per unit for current bazaar order
-    pub bazaar_price_per_unit: Arc<RwLock<f64>>,
-    /// true = buy order, false = sell offer
-    pub bazaar_is_buy_order: Arc<RwLock<bool>>,
-    /// Which step of the bazaar flow we're in
-    pub bazaar_step: Arc<RwLock<BazaarStep>>,
-    // ---- Auction creation context (set in execute_command, read in window/sign handlers) ----
-    /// Item name for current auction listing
-    pub auction_item_name: Arc<RwLock<String>>,
-    /// Starting bid for current auction
-    pub auction_starting_bid: Arc<RwLock<u64>>,
-    /// Duration in hours for current auction
-    pub auction_duration_hours: Arc<RwLock<u64>>,
-    /// Mineflayer inventory slot (9-44) for item to auction
-    pub auction_item_slot: Arc<RwLock<Option<u64>>>,
-    /// ExtraAttributes.id of item to auction (for identity verification)
-    pub auction_item_id: Arc<RwLock<Option<String>>>,
-    /// Which step of the auction creation flow we're in
-    pub auction_step: Arc<RwLock<AuctionStep>>,
-    /// Set when Hypixel rejects auction item placement ("You already have an item in the
-    /// auction slot!"). Checked before ConfirmSell/FinalConfirm to abort the flow and
-    /// prevent listing the wrong item.
-    pub auction_sell_aborted: Arc<AtomicBool>,
-    /// Number of times the auction sell flow has been retried due to a stuck item in the
-    /// auction slot.  Reset at the start of each SellToAuction command.  When this reaches
-    /// MAX_AUCTION_STUCK_ITEM_RETRIES the bot gives up and goes Idle.
-    pub auction_stuck_item_retries: Arc<std::sync::atomic::AtomicU8>,
+    // ---- Grouped sub-contexts ----
+    pub bazaar: BazaarCtx,
+    pub auction: AuctionCtx,
     /// Scoreboard scores: objective_name -> (owner -> (display_text, score))
     pub scoreboard_scores: Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>,
     /// Which objective is currently displayed in the sidebar slot
@@ -1050,20 +942,6 @@ pub struct BotClientState {
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
-    /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
-    /// Cleared when an order fills. Prevents placing new orders while at the cap.
-    pub bazaar_at_limit: Arc<AtomicBool>,
-    /// Set when "[Bazaar] You reached the daily limit" is detected.
-    /// Cleared on account switch or at 0:00 UTC daily reset.
-    pub bazaar_daily_limit: Arc<AtomicBool>,
-    /// Set when "Maximum auction count reached" is detected in the Manage Auctions GUI.
-    /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
-    /// SellToAuction → /ah → limit-detected → idle loops.
-    pub auction_at_limit: Arc<AtomicBool>,
-    /// Set when the server rejects an order placement (e.g. "Your price isn't
-    /// competitive enough").  Cleared before each confirm-click so only the
-    /// response to the *current* placement attempt is captured.
-    pub bazaar_order_rejected: Arc<AtomicBool>,
     /// Time when /viewauction was sent — start of buy-speed measurement.
     /// Shared with `BotClient` so main.rs can set it when the flip arrives.
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
@@ -1117,45 +995,10 @@ pub struct BotClientState {
     /// rebuild (ContainerSetContent / ContainerSetSlot).  Used to verify the
     /// inventory_full flag is not stale (e.g. after a manual instasell).
     pub cached_empty_player_slots: Arc<std::sync::atomic::AtomicU8>,
-    /// Item name to instasell via bazaar "Sell Instantly" when inventory is dominated
-    /// by one stackable item type. Set by ManageOrders, consumed by InstaSelling handler.
-    pub insta_sell_item: Arc<RwLock<Option<String>>>,
     /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
-    /// Items the bot has listed on the AH (by lowercase item name).
-    /// Used to filter out coop member sales from our own sales.
-    pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
     /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
-    /// When true, the ManagingOrders handler also cancels open orders (startup mode).
-    /// When false, it only collects filled orders and leaves open orders untouched.
-    pub manage_orders_cancel_open: Arc<AtomicBool>,
-    /// Cancel open bazaar orders when they are older than this many minutes per million coins.
-    /// 0 disables age-based cancellation in periodic ManageOrders runs.
-    pub bazaar_order_cancel_minutes_per_million: u64,
-    /// Context of the order currently being processed in the ManageOrders iteration.
-    /// Stored when clicking an order in Branch B so that Branch C (separate "Order options"
-    /// window) can apply the same `cancel_due_to_age` logic.
-    /// Fields: `(is_buy, order_display_name, order_identity, filled_amount)` where
-    /// `order_identity` is the `(is_buy, item_tag)` tuple used by
-    /// `should_cancel_open_order_due_to_age()`, and `filled_amount` is the actual
-    /// filled quantity parsed from the "Filled: X/Y" lore line.
-    pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>, Option<u64>)>>>,
-    /// Cached "My Auctions" JSON shared with BotClient for instant replies.
-    pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
-    /// Persistent set of processed order names (normalized, slot-index-free) across
-    /// ManageOrders window re-navigations.  Prevents re-clicking/re-emitting events
-    /// for orders that were already handled in an earlier `/bz` cycle.
-    /// Cleared at the start of each ManageOrders command.
-    pub manage_orders_processed: Arc<RwLock<std::collections::HashSet<String>>>,
-    /// Item name of the auction to cancel (set by CancelAuction command).
-    pub cancel_auction_item_name: Arc<RwLock<String>>,
-    /// Starting bid of the auction to cancel (for accurate identification).
-    pub cancel_auction_starting_bid: Arc<RwLock<i64>>,
-    /// Deadline for the current ManageOrders run. Set at the start of each
-    /// ManageOrders command so that all window handlers (Branch A/B/C) can
-    /// bail out early instead of waiting for the external 60-second timeout.
-    pub manage_orders_deadline: Arc<RwLock<Option<tokio::time::Instant>>>,
     /// Shared AH-pause flag — when true, ManageOrders aborts early so AH
     /// flips can proceed without interference.
     pub bazaar_flips_paused: Arc<AtomicBool>,
@@ -1182,11 +1025,6 @@ pub struct BotClientState {
     /// Whether bazaar flips are enabled.  Shared with `BotClient` so the
     /// startup workflow can decide whether to cancel all open bazaar orders.
     pub enable_bazaar_flips: Arc<AtomicBool>,
-    /// Persistent counter of cancel failures per order (normalized name → count).
-    /// When a cancel attempt fails in Order options, the counter is incremented.
-    /// After `MAX_CANCEL_RETRIES` failures for the same order, the order is skipped.
-    /// Cleared on successful cancel or at the start of a `cancel_open` ManageOrders run.
-    pub order_cancel_failures: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl Default for BotClientState {
@@ -1207,27 +1045,12 @@ impl Default for BotClientState {
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
             claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
-            bazaar_item_name: Arc::new(RwLock::new(String::new())),
-            bazaar_amount: Arc::new(RwLock::new(0)),
-            bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
-            bazaar_is_buy_order: Arc::new(RwLock::new(true)),
-            bazaar_step: Arc::new(RwLock::new(BazaarStep::Initial)),
-            auction_item_name: Arc::new(RwLock::new(String::new())),
-            auction_starting_bid: Arc::new(RwLock::new(0)),
-            auction_duration_hours: Arc::new(RwLock::new(24)),
-            auction_item_slot: Arc::new(RwLock::new(None)),
-            auction_item_id: Arc::new(RwLock::new(None)),
-            auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
-            auction_sell_aborted: Arc::new(AtomicBool::new(false)),
-            auction_stuck_item_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            bazaar: BazaarCtx::new(5),
+            auction: AuctionCtx::new(),
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
-            bazaar_at_limit: Arc::new(AtomicBool::new(false)),
-            bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
-            auction_at_limit: Arc::new(AtomicBool::new(false)),
-            bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -1247,18 +1070,8 @@ impl Default for BotClientState {
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: Arc::new(AtomicBool::new(false)),
             cached_empty_player_slots: Arc::new(std::sync::atomic::AtomicU8::new(36)),
-            insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
-            active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
-            manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
-            bazaar_order_cancel_minutes_per_million: 5,
-            managing_order_context: Arc::new(RwLock::new(None)),
-            cached_my_auctions_json: Arc::new(RwLock::new(None)),
-            manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
-            cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
-            cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
-            manage_orders_deadline: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
@@ -1267,7 +1080,6 @@ impl Default for BotClientState {
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
-            order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -1976,7 +1788,7 @@ async fn event_handler(
             
             // Reset the cancel-failure tracker on login so previously-stuck
             // orders get a fresh set of retry attempts after reconnect.
-            state.order_cancel_failures.write().clear();
+            state.bazaar.order_cancel_failures.write().clear();
 
             // Keep GracePeriod state – allows commands/flips just like TypeScript.
             // Do NOT set to Startup here; Startup is reserved for an active startup workflow.
@@ -2137,7 +1949,7 @@ async fn event_handler(
                     } else {
                         let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
                         // Housekeeping: remove from active listings if present
-                        state.active_auction_listings.write().remove(&item_key);
+                        state.auction.active_listings.write().remove(&item_key);
                         // Try to extract the auction UUID from the JSON representation of the
                         // chat message first — Hypixel embeds "/viewauction <UUID>" in the
                         // clickEvent of the "CLICK" component, which is invisible in plain text
@@ -2160,9 +1972,9 @@ async fn event_handler(
                         }
                         *state.claim_sold_uuid.write() = uuid;
                         // An auction sold — a slot is now free; clear the auction-limit flag.
-                        if state.auction_at_limit.load(Ordering::Relaxed) {
+                        if state.auction.at_limit.load(Ordering::Relaxed) {
                             info!("[Auction] Auction sold, clearing auction-limit flag");
-                            state.auction_at_limit.store(false, Ordering::Relaxed);
+                            state.auction.at_limit.store(false, Ordering::Relaxed);
                         }
                         let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                     }
@@ -2174,10 +1986,10 @@ async fn event_handler(
                 if *state.bot_state.read() == BotState::Selling {
                     // fetch_add returns the *previous* value, so attempt 0..2 are the
                     // 3 retry attempts (when MAX is 3); attempt 3 triggers the give-up.
-                    let attempt = state.auction_stuck_item_retries.fetch_add(1, Ordering::Relaxed);
+                    let attempt = state.auction.stuck_item_retries.fetch_add(1, Ordering::Relaxed);
 
                     // Common to both paths: abort current flow and close the window.
-                    state.auction_sell_aborted.store(true, Ordering::Relaxed);
+                    state.auction.sell_aborted.store(true, Ordering::Relaxed);
                     let window_id = *state.last_window_id.read();
                     if window_id > 0 {
                         send_raw_close(&bot, window_id, &state.handlers);
@@ -2196,7 +2008,7 @@ async fn event_handler(
                         );
                         // Restart the auction flow: reset step and re-open /ah after a
                         // delay so Hypixel processes the window close first.
-                        *state.auction_step.write() = AuctionStep::Initial;
+                        *state.auction.step.write() = AuctionStep::Initial;
                         let bot_clone = bot.clone();
                         let state_clone = state.clone();
                         tokio::spawn(async move {
@@ -2204,7 +2016,7 @@ async fn event_handler(
                             // Only retry if still in Selling state (not interrupted by another command)
                             if *state_clone.bot_state.read() == BotState::Selling {
                                 info!("[Auction] Retrying auction after removing stuck item — sending /ah");
-                                state_clone.auction_sell_aborted.store(false, Ordering::Relaxed);
+                                state_clone.auction.sell_aborted.store(false, Ordering::Relaxed);
                                 send_chat_command(&bot_clone, "/ah");
                             }
                         });
@@ -2214,9 +2026,9 @@ async fn event_handler(
                 // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
                 // was accepted.  Emit AuctionListed using the context stored in state.
                 // This matches TypeScript sellHandler.ts messageListener pattern.
-                let item = state.auction_item_name.read().clone();
-                let bid  = *state.auction_starting_bid.read();
-                let dur  = *state.auction_duration_hours.read();
+                let item = state.auction.item_name.read().clone();
+                let bid  = *state.auction.starting_bid.read();
+                let dur  = *state.auction.duration_hours.read();
 
                 // Diagnostic safety check: verify the listed item roughly matches what
                 // we intended.  Hypixel includes reforge/star prefixes (e.g. "Withered
@@ -2244,10 +2056,10 @@ async fn event_handler(
                 // Track this as our active listing for coop sale filtering
                 if !item.is_empty() {
                     let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
-                    state.active_auction_listings.write().insert(item_key);
+                    state.auction.active_listings.write().insert(item_key);
                 }
                 // Listing succeeded — clear any stale auction-limit flag.
-                state.auction_at_limit.store(false, Ordering::Relaxed);
+                state.auction.at_limit.store(false, Ordering::Relaxed);
                 if !item.is_empty() {
                     info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
                     let _ = state.event_tx.send(BotEvent::AuctionListed {
@@ -2321,26 +2133,26 @@ async fn event_handler(
             // and clear it when an order fills ("Claimed ... coins from ...").
             if clean_message.contains("You reached your maximum of") && clean_message.contains("Bazaar orders") {
                 warn!("[Bazaar] Order limit reached — pausing bazaar flips until a slot frees up");
-                state.bazaar_at_limit.store(true, Ordering::Relaxed);
+                state.bazaar.at_limit.store(true, Ordering::Relaxed);
             } else if clean_message.contains("[Bazaar]") && (clean_message.contains("coins from selling") || clean_message.contains("coins from buying")) {
                 // An order was collected — a slot is now free
-                if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                if state.bazaar.at_limit.load(Ordering::Relaxed) {
                     info!("[Bazaar] Order collected, clearing order-limit flag");
-                    state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                    state.bazaar.at_limit.store(false, Ordering::Relaxed);
                 }
             }
 
             // Detect bazaar daily sell value limit
             if clean_message.contains("You reached the daily limit") && clean_message.contains("bazaar") {
                 warn!("[Bazaar] Daily sell value limit reached — pausing bazaar flips until 0:00 UTC");
-                state.bazaar_daily_limit.store(true, Ordering::Relaxed);
+                state.bazaar.daily_limit.store(true, Ordering::Relaxed);
             }
 
             // Detect bazaar order rejection ("Your price isn't competitive enough")
             // so the confirm handler knows not to emit BazaarOrderPlaced.
             if clean_message.contains("[Bazaar]") && clean_message.contains("Your price isn't competitive enough") {
                 warn!("[Bazaar] Order rejected — price not competitive");
-                state.bazaar_order_rejected.store(true, Ordering::Relaxed);
+                state.bazaar.order_rejected.store(true, Ordering::Relaxed);
             }
 
             // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
@@ -2397,7 +2209,7 @@ async fn event_handler(
                 && *state.bot_state.read() == BotState::SellingInventoryBz
             {
                 info!("[SellInventoryBz] Nothing to sell — closing window and going idle");
-                *state.bazaar_step.write() = BazaarStep::Initial;
+                *state.bazaar.sell_inventory_step.write() = SellInventoryStep::Initial;
                 let wid = *state.last_window_id.read();
                 if wid > 0 {
                     send_raw_close(&bot, wid, &state.handlers);
@@ -2560,8 +2372,8 @@ async fn event_handler(
                         let wdog_bed   = state.bed_timing_active.clone();
                         let wdog_gen   = state.command_generation.clone();
                         let wdog_gen_at_open = state.command_generation.load(Ordering::SeqCst);
-                        let wdog_deadline = state.manage_orders_deadline.clone();
-                        let wdog_bz_limit = state.bazaar_at_limit.clone();
+                        let wdog_deadline = state.bazaar.manage_orders_deadline.clone();
+                        let wdog_bz_limit = state.bazaar.at_limit.clone();
                         let wdog_handlers = state.handlers.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -2717,18 +2529,18 @@ async fn event_handler(
                     // (matching TypeScript's bot._client.once('open_sign_entity')).
                     let bot_state = *state.bot_state.read();
                     if bot_state == BotState::Bazaar {
-                        let step = *state.bazaar_step.read();
+                        let step = *state.bazaar.step.read();
                         let pos = pkt.pos;
                         let is_front = pkt.is_front_text;
 
                         let text_to_write = match step {
                             BazaarStep::SetAmount => {
-                                let amount = *state.bazaar_amount.read();
+                                let amount = *state.bazaar.amount.read();
                                 info!("[Bazaar] Sign opened for amount — writing: {}", amount);
                                 amount.to_string()
                             }
                             BazaarStep::SetPrice => {
-                                let price = *state.bazaar_price_per_unit.read();
+                                let price = *state.bazaar.price_per_unit.read();
                                 let s = format_price_for_sign(price);
                                 info!("[Bazaar] Sign opened for price — writing: {}", s);
                                 s
@@ -2738,10 +2550,10 @@ async fn event_handler(
                                 // (direct-sign flow — no intermediate "Custom Price" GUI button).
                                 // Treat this as the price sign (matching TypeScript behaviour where
                                 // sell offers go straight to the price sign).
-                                let price = *state.bazaar_price_per_unit.read();
+                                let price = *state.bazaar.price_per_unit.read();
                                 let s = format_price_for_sign(price);
                                 info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", s);
-                                *state.bazaar_step.write() = BazaarStep::SetPrice;
+                                *state.bazaar.step.write() = BazaarStep::SetPrice;
                                 s
                             }
                             _ => {
@@ -2768,22 +2580,22 @@ async fn event_handler(
                     } else if bot_state == BotState::Selling {
                         // Auction sign handler — matches TypeScript's setAuctionDuration and
                         // bot._client.once('open_sign_entity') for price in sellHandler.ts
-                        if state.auction_sell_aborted.load(Ordering::Relaxed) {
+                        if state.auction.sell_aborted.load(Ordering::Relaxed) {
                             warn!("[Auction] Sign opened but auction sell aborted — skipping");
                             return Ok(());
                         }
-                        let step = *state.auction_step.read();
+                        let step = *state.auction.step.read();
                         let pos = pkt.pos;
                         let is_front = pkt.is_front_text;
 
                         let (text_to_write, next_step) = match step {
                             AuctionStep::PriceSign => {
-                                let price = *state.auction_starting_bid.read();
+                                let price = *state.auction.starting_bid.read();
                                 info!("[Auction] Sign opened for price — writing: {}", price);
                                 (price.to_string(), AuctionStep::SetDuration)
                             }
                             AuctionStep::DurationSign => {
-                                let hours = *state.auction_duration_hours.read();
+                                let hours = *state.auction.duration_hours.read();
                                 info!("[Auction] Sign opened for duration — writing: {} hours", hours);
                                 (hours.to_string(), AuctionStep::ConfirmSell)
                             }
@@ -2793,7 +2605,7 @@ async fn event_handler(
                             }
                         };
 
-                        *state.auction_step.write() = next_step;
+                        *state.auction.step.write() = next_step;
                         let packet = ServerboundSignUpdate {
                             pos,
                             is_front_text: is_front,
@@ -2980,16 +2792,16 @@ async fn execute_command(
         CommandType::BazaarBuyOrder { item_name, item_tag, amount, price_per_unit } => {
             // Abort immediately if at the bazaar order limit — no point opening
             // the GUI only to have the order rejected.
-            if state.bazaar_at_limit.load(Ordering::Relaxed) {
+            if state.bazaar.at_limit.load(Ordering::Relaxed) {
                 warn!("[Bazaar] Skipping BUY order for \"{}\" — already at bazaar order limit", item_name);
                 return;
             }
             // Store order context so window/sign handlers can use it
-            *state.bazaar_item_name.write() = item_name.clone();
-            *state.bazaar_amount.write() = *amount;
-            *state.bazaar_price_per_unit.write() = *price_per_unit;
-            *state.bazaar_is_buy_order.write() = true;
-            *state.bazaar_step.write() = BazaarStep::Initial;
+            *state.bazaar.item_name.write() = item_name.clone();
+            *state.bazaar.amount.write() = *amount;
+            *state.bazaar.price_per_unit.write() = *price_per_unit;
+            *state.bazaar.is_buy_order.write() = true;
+            *state.bazaar.step.write() = BazaarStep::Initial;
 
             // Use itemTag when available (skips search results page), else title-case itemName
             let search_term = item_tag.as_ref().map(|s| s.as_str())
@@ -3005,16 +2817,16 @@ async fn execute_command(
         }
         CommandType::BazaarSellOrder { item_name, item_tag, amount, price_per_unit } => {
             // Abort immediately if at the bazaar order limit
-            if state.bazaar_at_limit.load(Ordering::Relaxed) {
+            if state.bazaar.at_limit.load(Ordering::Relaxed) {
                 warn!("[Bazaar] Skipping SELL order for \"{}\" — already at bazaar order limit", item_name);
                 return;
             }
             // Store order context so window/sign handlers can use it
-            *state.bazaar_item_name.write() = item_name.clone();
-            *state.bazaar_amount.write() = *amount;
-            *state.bazaar_price_per_unit.write() = *price_per_unit;
-            *state.bazaar_is_buy_order.write() = false;
-            *state.bazaar_step.write() = BazaarStep::Initial;
+            *state.bazaar.item_name.write() = item_name.clone();
+            *state.bazaar.amount.write() = *amount;
+            *state.bazaar.price_per_unit.write() = *price_per_unit;
+            *state.bazaar.is_buy_order.write() = false;
+            *state.bazaar.step.write() = BazaarStep::Initial;
 
             // Use itemTag when available, else title-case itemName
             let search_term = item_tag.as_ref().map(|s| s.as_str())
@@ -3059,14 +2871,14 @@ async fn execute_command(
         CommandType::SellToAuction { item_name, starting_bid, duration_hours, item_slot, item_id } => {
             info!("Creating auction: {} at {} coins for {} hours", item_name, starting_bid, duration_hours);
             // Store context for window/sign handlers (matches TypeScript sellHandler.ts)
-            *state.auction_item_name.write() = item_name.clone();
-            *state.auction_starting_bid.write() = *starting_bid;
-            *state.auction_duration_hours.write() = *duration_hours;
-            *state.auction_item_slot.write() = *item_slot;
-            *state.auction_item_id.write() = item_id.clone();
-            *state.auction_step.write() = AuctionStep::Initial;
-            state.auction_sell_aborted.store(false, Ordering::Relaxed);
-            state.auction_stuck_item_retries.store(0, Ordering::Relaxed);
+            *state.auction.item_name.write() = item_name.clone();
+            *state.auction.starting_bid.write() = *starting_bid;
+            *state.auction.duration_hours.write() = *duration_hours;
+            *state.auction.item_slot.write() = *item_slot;
+            *state.auction.item_id.write() = item_id.clone();
+            *state.auction.step.write() = AuctionStep::Initial;
+            state.auction.sell_aborted.store(false, Ordering::Relaxed);
+            state.auction.stuck_item_retries.store(0, Ordering::Relaxed);
             // Open auction house — window handler takes over from here
             send_chat_command(bot, "/ah");
             *state.bot_state.write() = BotState::Selling;
@@ -3116,15 +2928,15 @@ async fn execute_command(
             //   2. InstaSell completion.
             // This lets ManageOrders skip BUY orders when the flag is set while
             // still collecting SELL orders (which yield coins, not items).
-            state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
-            state.manage_orders_processed.write().clear();
+            state.bazaar.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
+            state.bazaar.manage_orders_processed.write().clear();
             // Do NOT clear order_cancel_failures here — let failures accumulate
             // across ManageOrders cycles so MAX_CANCEL_RETRIES actually works.
             // The counter is only cleared on login/reconnect (Login event handler).
             // Set an internal deadline so the handler can bail out cleanly
             // (closing windows) instead of burning through the external timeout.
             // Only processes ONE order per cycle, so 10s is plenty.
-            *state.manage_orders_deadline.write() = Some(
+            *state.bazaar.manage_orders_deadline.write() = Some(
                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(10)
             );
             let initial_wid = *state.last_window_id.read();
@@ -3159,14 +2971,14 @@ async fn execute_command(
         }
         CommandType::CancelAuction { item_name, starting_bid } => {
             info!("[CancelAuction] Cancelling auction: {} (bid: {})", item_name, starting_bid);
-            *state.cancel_auction_item_name.write() = item_name.clone();
-            *state.cancel_auction_starting_bid.write() = *starting_bid;
+            *state.auction.cancel_item_name.write() = item_name.clone();
+            *state.auction.cancel_starting_bid.write() = *starting_bid;
             send_chat_command(bot, "/ah");
             *state.bot_state.write() = BotState::CancellingAuction;
         }
         CommandType::SellInventoryBz => {
             info!("[SellInventoryBz] Opening /bz to sell inventory instantly");
-            *state.bazaar_step.write() = BazaarStep::Initial;
+            *state.bazaar.sell_inventory_step.write() = SellInventoryStep::Initial;
             send_chat_command(bot, "/bz");
             *state.bot_state.write() = BotState::SellingInventoryBz;
         }
@@ -3546,9 +3358,9 @@ async fn handle_window_interaction(
             //
             // Sign writing is handled separately in the OpenSignEditor packet handler below.
 
-            let item_name = state.bazaar_item_name.read().clone();
-            let is_buy_order = *state.bazaar_is_buy_order.read();
-            let current_step = *state.bazaar_step.read();
+            let item_name = state.bazaar.item_name.read().clone();
+            let is_buy_order = *state.bazaar.is_buy_order.read();
+            let current_step = *state.bazaar.step.read();
 
             info!("[Bazaar] Window: \"{}\" | step: {:?}", window_title, current_step);
 
@@ -3618,7 +3430,7 @@ async fn handle_window_interaction(
                         return;
                     }
                     info!("[Bazaar] Item detail: clicking \"{}\" at slot {}", order_btn_name, i);
-                    *state.bazaar_step.write() = BazaarStep::SelectOrderType;
+                    *state.bazaar.step.write() = BazaarStep::SelectOrderType;
                     // Add randomized human-like delay before clicking (200-500ms)
                     let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 300) as u64;
                     tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
@@ -3633,7 +3445,7 @@ async fn handle_window_interaction(
             // where the item appears in the grid but order buttons are not yet visible.
             if window_title.contains("Bazaar") && current_step == BazaarStep::Initial {
                 info!("[Bazaar] Search results: looking for \"{}\"", item_name);
-                *state.bazaar_step.write() = BazaarStep::SearchResults;
+                *state.bazaar.step.write() = BazaarStep::SearchResults;
 
                 // Poll briefly for the item to appear in search results
                 let found = loop {
@@ -3686,7 +3498,7 @@ async fn handle_window_interaction(
             {
                 if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Amount screen: clicking Custom Amount at slot {}", i);
-                *state.bazaar_step.write() = BazaarStep::SetAmount;
+                *state.bazaar.step.write() = BazaarStep::SetAmount;
                 click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
             }
@@ -3696,7 +3508,7 @@ async fn handle_window_interaction(
             {
                 if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);
-                *state.bazaar_step.write() = BazaarStep::SetPrice;
+                *state.bazaar.step.write() = BazaarStep::SetPrice;
                 click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
             }
@@ -3704,10 +3516,10 @@ async fn handle_window_interaction(
             else if current_step == BazaarStep::SetPrice {
                 if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Confirm screen: clicking slot 13");
-                *state.bazaar_step.write() = BazaarStep::Confirm;
+                *state.bazaar.step.write() = BazaarStep::Confirm;
                 // Clear rejection flag before clicking so we only capture the
                 // response to *this* placement attempt.
-                state.bazaar_order_rejected.store(false, Ordering::Relaxed);
+                state.bazaar.order_rejected.store(false, Ordering::Relaxed);
                 // Add randomized human-like delay before confirming (300-700ms)
                 let jitter = 300 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 400) as u64;
                 tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
@@ -3716,14 +3528,14 @@ async fn handle_window_interaction(
                 // Wait briefly for the server to respond (limit/rejection message arrives asynchronously)
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-                if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                if state.bazaar.at_limit.load(Ordering::Relaxed) {
                     warn!("[Bazaar] Order rejected (at limit) — not emitting BazaarOrderPlaced");
-                } else if state.bazaar_order_rejected.load(Ordering::Relaxed) {
+                } else if state.bazaar.order_rejected.load(Ordering::Relaxed) {
                     warn!("[Bazaar] Order rejected (price not competitive) — not emitting BazaarOrderPlaced");
                 } else {
                     let item = item_name.clone();
-                    let amount = *state.bazaar_amount.read();
-                    let price_per_unit = *state.bazaar_price_per_unit.read();
+                    let amount = *state.bazaar.amount.read();
+                    let price_per_unit = *state.bazaar.price_per_unit.read();
                     let total_value = amount as f64 * price_per_unit;
                     log_bazaar_order_placed(is_buy_order, &item, total_value);
                     let _ = state.event_tx.send(BotEvent::BazaarOrderPlaced {
@@ -3743,14 +3555,14 @@ async fn handle_window_interaction(
             // Triggered by ManageOrders when inventory is full and one item type occupies
             // more than half the player inventory slots.
             //
-            // Flow (reuses bazaar_step for sub-state):
-            //   Initial       — bazaar search page: find item by name, click it
-            //   SearchResults — item detail page: find "Sell Instantly", click it
-            //   SelectOrderType — confirmation/warning page: wait ≤5 s, confirm
+            // Flow (tracked by insta_sell_step):
+            //   FindItem       — bazaar search page: find item by name, click it
+            //   FindSellButton — item detail page: find "Sell Instantly", click it
+            //   WaitConfirm    — confirmation/warning page: wait ≤5 s, confirm
             //
             // After confirmation the bot opens /bz and returns to ManagingOrders so the
             // collect loop can retry now that there is inventory space.
-            let item_name = match state.insta_sell_item.read().clone() {
+            let item_name = match state.bazaar.insta_sell_item.read().clone() {
                 Some(name) => name,
                 None => {
                     warn!("[InstaSell] No item name stored, closing window and going idle");
@@ -3765,13 +3577,13 @@ async fn handle_window_interaction(
                 return;
             }
 
-            let step = *state.bazaar_step.read();
+            let step = *state.bazaar.insta_sell_step.read();
             info!("[InstaSell] Window: \"{}\" | step: {:?} | item: \"{}\"", window_title, step, item_name);
 
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
             if *state.last_window_id.read() != window_id { return; }
 
-            if step == BazaarStep::Initial && window_title.contains("Bazaar") {
+            if step == InstaSellStep::FindItem && window_title.contains("Bazaar") {
                 // Search results: find the item by name and click it
                 let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
                 let item_slot = loop {
@@ -3787,17 +3599,18 @@ async fn handle_window_interaction(
                     Some(i) => {
                         if *state.last_window_id.read() != window_id { return; }
                         info!("[InstaSell] Found \"{}\" at slot {}, clicking", item_name, i);
-                        *state.bazaar_step.write() = BazaarStep::SearchResults;
+                        *state.bazaar.insta_sell_step.write() = InstaSellStep::FindSellButton;
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
                         warn!("[InstaSell] Item \"{}\" not found in bazaar search, closing window and going idle", item_name);
                         send_raw_close(bot, window_id, &state.handlers);
-                        *state.insta_sell_item.write() = None;
+                        *state.bazaar.insta_sell_item.write() = None;
+                        *state.bazaar.insta_sell_step.write() = InstaSellStep::FindItem;
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
-            } else if step == BazaarStep::SearchResults {
+            } else if step == InstaSellStep::FindSellButton {
                 // Item detail page: find "Sell Instantly" and click it
                 let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
                 let sell_slot = loop {
@@ -3813,17 +3626,18 @@ async fn handle_window_interaction(
                     Some(i) => {
                         if *state.last_window_id.read() != window_id { return; }
                         info!("[InstaSell] Clicking \"Sell Instantly\" at slot {}", i);
-                        *state.bazaar_step.write() = BazaarStep::SelectOrderType;
+                        *state.bazaar.insta_sell_step.write() = InstaSellStep::WaitConfirm;
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
                         warn!("[InstaSell] \"Sell Instantly\" not found, closing window and going idle");
                         send_raw_close(bot, window_id, &state.handlers);
-                        *state.insta_sell_item.write() = None;
+                        *state.bazaar.insta_sell_item.write() = None;
+                        *state.bazaar.insta_sell_step.write() = InstaSellStep::FindItem;
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
-            } else if step == BazaarStep::SelectOrderType {
+            } else if step == InstaSellStep::WaitConfirm {
                 // Confirmation page (warning may be present for up to 5 seconds).
                 // Wait up to 5 s for a "Confirm" button, then click it.
                 info!("[InstaSell] Waiting up to 5s for confirm button...");
@@ -3853,8 +3667,8 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 // Reset and return to ManagingOrders so collect can retry
                 info!("[InstaSell] Complete — returning to ManageOrders");
-                *state.insta_sell_item.write() = None;
-                *state.bazaar_step.write() = BazaarStep::Initial;
+                *state.bazaar.insta_sell_item.write() = None;
+                *state.bazaar.insta_sell_step.write() = InstaSellStep::FindItem;
                 state.inventory_full.store(false, Ordering::Relaxed);
                 *state.bot_state.write() = BotState::ManagingOrders;
                 send_chat_command(bot, "/bz");
@@ -4008,8 +3822,8 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                let target_name = state.cancel_auction_item_name.read().clone();
-                let target_bid = *state.cancel_auction_starting_bid.read();
+                let target_name = state.auction.cancel_item_name.read().clone();
+                let target_bid = *state.auction.cancel_starting_bid.read();
                 let target_lower = target_name.to_lowercase();
                 // Find the auction slot matching item_name + starting_bid
                 let mut found = false;
@@ -4082,8 +3896,8 @@ async fn handle_window_interaction(
                 }
                 info!("[CancelAuction] Auction cancellation confirmed, closing window and going idle");
                 send_raw_close(bot, window_id, &state.handlers);
-                let cancelled_name = state.cancel_auction_item_name.read().clone();
-                let cancelled_bid = *state.cancel_auction_starting_bid.read();
+                let cancelled_name = state.auction.cancel_item_name.read().clone();
+                let cancelled_bid = *state.auction.cancel_starting_bid.read();
                 let _ = state.event_tx.send(BotEvent::AuctionCancelled {
                     item_name: cancelled_name,
                     starting_bid: cancelled_bid as u64,
@@ -4099,9 +3913,9 @@ async fn handle_window_interaction(
             // Wait for ContainerSetContent to populate slots
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
-            let step = *state.auction_step.read();
-            let item_name = state.auction_item_name.read().clone();
-            let item_slot_opt = *state.auction_item_slot.read();
+            let step = *state.auction.step.read();
+            let item_name = state.auction.item_name.read().clone();
+            let item_slot_opt = *state.auction.item_slot.read();
             let menu = bot.menu();
             let slots = menu.slots();
 
@@ -4110,7 +3924,7 @@ async fn handle_window_interaction(
             // If the sell was aborted (e.g. stuck item in auction slot), do not
             // proceed — close the window and bail.  The retry task spawned by the
             // chat handler will re-open /ah once the window is closed.
-            if state.auction_sell_aborted.load(Ordering::Relaxed) {
+            if state.auction.sell_aborted.load(Ordering::Relaxed) {
                 warn!("[Auction] Window opened but auction sell aborted — closing window {}", window_id);
                 send_raw_close(bot, window_id, &state.handlers);
                 return;
@@ -4121,7 +3935,7 @@ async fn handle_window_interaction(
                     // "Auction House" opened — click slot 15 (nav to Manage Auctions)
                     if window_title.contains("Auction House") {
                         info!("[Auction] AH opened, clicking slot 15 (Manage Auctions nav)");
-                        *state.auction_step.write() = AuctionStep::OpenManage;
+                        *state.auction.step.write() = AuctionStep::OpenManage;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, &state.last_window_id, window_id, 15).await;
                     }
@@ -4135,13 +3949,13 @@ async fn handle_window_interaction(
                             let lore_text = lore.join(" ").to_lowercase();
                             if lore_text.contains("maximum") || lore_text.contains("limit") {
                                 warn!("[Auction] Maximum auction count reached, going idle");
-                                state.auction_at_limit.store(true, Ordering::Relaxed);
+                                state.auction.at_limit.store(true, Ordering::Relaxed);
                                 send_raw_close(bot, window_id, &state.handlers);
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
                             info!("[Auction] Clicking Create Auction at slot {}", i);
-                            *state.auction_step.write() = AuctionStep::ClickCreate;
+                            *state.auction.step.write() = AuctionStep::ClickCreate;
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                         } else {
@@ -4152,7 +3966,7 @@ async fn handle_window_interaction(
                     } else if window_title.contains("Create Auction") && !window_title.contains("BIN") {
                         // Co-op AH or similar: jumped directly to "Create Auction" — click slot 48 (BIN)
                         info!("[Auction] Skipped Manage Auctions, in Create Auction — clicking slot 48 (BIN)");
-                        *state.auction_step.write() = AuctionStep::SelectBIN;
+                        *state.auction.step.write() = AuctionStep::SelectBIN;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, &state.last_window_id, window_id, 48).await;
                     } else if window_title.contains("Create BIN Auction") {
@@ -4182,7 +3996,7 @@ async fn handle_window_interaction(
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Co-op AH: clicking slot 31 (price setter)");
-                            *state.auction_step.write() = AuctionStep::PriceSign;
+                            *state.auction.step.write() = AuctionStep::PriceSign;
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
@@ -4195,7 +4009,7 @@ async fn handle_window_interaction(
                     // "Create Auction" opened — click slot 48 (BIN auction type)
                     if window_title.contains("Create Auction") && !window_title.contains("BIN") {
                         info!("[Auction] Create Auction window opened, clicking slot 48 (BIN)");
-                        *state.auction_step.write() = AuctionStep::SelectBIN;
+                        *state.auction.step.write() = AuctionStep::SelectBIN;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, &state.last_window_id, window_id, 48).await;
                     } else if window_title.contains("Create BIN Auction") {
@@ -4228,7 +4042,7 @@ async fn handle_window_interaction(
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] ClickCreate→SelectBIN: clicking slot 31 (price setter)");
-                            *state.auction_step.write() = AuctionStep::PriceSign;
+                            *state.auction.step.write() = AuctionStep::PriceSign;
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] ClickCreate→SelectBIN: item \"{}\" not found, going idle", item_name);
@@ -4279,7 +4093,7 @@ async fn handle_window_interaction(
                             // Click slot 31 (price setter) — sign will open, handled in OpenSignEditor
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Clicking slot 31 (price setter)");
-                            *state.auction_step.write() = AuctionStep::PriceSign;
+                            *state.auction.step.write() = AuctionStep::PriceSign;
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
@@ -4293,7 +4107,7 @@ async fn handle_window_interaction(
                     // Click slot 33 to open "Auction Duration" window
                     if window_title.contains("Create BIN Auction") {
                         info!("[Auction] Price set, clicking slot 33 (duration)");
-                        *state.auction_step.write() = AuctionStep::DurationSign;
+                        *state.auction.step.write() = AuctionStep::DurationSign;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, &state.last_window_id, window_id, 33).await;
                     }
@@ -4312,14 +4126,14 @@ async fn handle_window_interaction(
                     // Click slot 29 to proceed to "Confirm BIN Auction"
                     if window_title.contains("Create BIN Auction") {
                         // Check if the sell was aborted (e.g. wrong item in auction slot)
-                        if state.auction_sell_aborted.load(Ordering::Relaxed) {
+                        if state.auction.sell_aborted.load(Ordering::Relaxed) {
                             warn!("[Auction] ConfirmSell aborted — wrong item detected, closing window");
                             send_raw_close(bot, window_id, &state.handlers);
                             // Stay in Selling state so the retry task can re-open /ah
                             return;
                         }
                         info!("[Auction] Both price and duration set, clicking slot 29 (confirm item)");
-                        *state.auction_step.write() = AuctionStep::FinalConfirm;
+                        *state.auction.step.write() = AuctionStep::FinalConfirm;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, &state.last_window_id, window_id, 29).await;
                     }
@@ -4330,7 +4144,7 @@ async fn handle_window_interaction(
                     // "BIN Auction started for ..." (matches TypeScript sellHandler.ts).
                     if window_title.contains("Confirm BIN Auction") || window_title.contains("Confirm") {
                         // Check if the sell was aborted (e.g. wrong item in auction slot)
-                        if state.auction_sell_aborted.load(Ordering::Relaxed) {
+                        if state.auction.sell_aborted.load(Ordering::Relaxed) {
                             warn!("[Auction] FinalConfirm aborted — wrong item detected, closing window");
                             send_raw_close(bot, window_id, &state.handlers);
                             // Stay in Selling state so the retry task can re-open /ah
@@ -4362,7 +4176,7 @@ async fn handle_window_interaction(
                 return;
             }
 
-            let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
+            let cancel_open = state.bazaar.manage_orders_cancel_open.load(Ordering::Relaxed);
             if window_title.contains("Bazaar") && !is_bazaar_orders_window_title(window_title) {
                 // Bazaar page (main or category) — find "Manage Orders" button
                 // dynamically.  Hypixel may rearrange slots across updates, so we
@@ -4380,7 +4194,7 @@ async fn handle_window_interaction(
                 // We process only one order then go Idle so bazaar flips aren't blocked.
                 let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
                 info!("[ManageOrders] Processing orders ({}) — single order per cycle", mode_str);
-                let persistent_processed = &state.manage_orders_processed;
+                let persistent_processed = &state.bazaar.manage_orders_processed;
 
                 // Wait for ContainerSetContent to populate the window
                 tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
@@ -4446,7 +4260,7 @@ async fn handle_window_interaction(
                 // bot stuck for the entire periodic-check interval.
                 // However, stale orders that exceed the cancel-due-to-age threshold
                 // must still be selected so they can be cancelled.
-                let cancel_mins = state.bazaar_order_cancel_minutes_per_million;
+                let cancel_mins = state.bazaar.cancel_minutes_per_million;
                 let mut inv_full = state.inventory_full.load(Ordering::Relaxed);
                 // When the flag is set, double-check the actual inventory.
                 // The flag can become stale after a manual instasell or
@@ -4490,8 +4304,8 @@ async fn handle_window_interaction(
                         // No orders to process — done.
                         info!("[ManageOrders] No actionable orders, closing window");
                         send_raw_close(bot, window_id, &state.handlers);
-                        *state.manage_orders_deadline.write() = None;
-                        state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                        *state.bazaar.manage_orders_deadline.write() = None;
+                        state.bazaar.at_limit.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     }
                     Some((i, order_name, order_identity, _processed_key, _claimable, order_filled_amount)) => {
@@ -4515,7 +4329,7 @@ async fn handle_window_interaction(
                                     log_pending_claim(&order_name);
                                     persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                                     send_raw_close(bot, window_id, &state.handlers);
-                                    *state.manage_orders_deadline.write() = None;
+                                    *state.bazaar.manage_orders_deadline.write() = None;
                                     *state.bot_state.write() = BotState::Idle;
                                     return;
                                 }
@@ -4523,7 +4337,7 @@ async fn handle_window_interaction(
                         }
 
                         // Store context for the Order options handler (Branch C)
-                        *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone(), order_filled_amount));
+                        *state.bazaar.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone(), order_filled_amount));
 
                         info!("[ManageOrders] Clicking order at slot {}: \"{}\"", i, order_name);
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
@@ -4575,7 +4389,7 @@ async fn handle_window_interaction(
                                 claimed_amount: order_filled_amount,
                             });
                             persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                            state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                            state.bazaar.at_limit.store(false, Ordering::Relaxed);
                         }
                         // else: "Order options" opened — Branch C handler takes over.
                         // It will handle collect/cancel/skip and then go Idle.
@@ -4592,7 +4406,7 @@ async fn handle_window_interaction(
                             // and transitioning to Idle.  Setting Idle here races with
                             // the Branch C handler and can cause it to miss the
                             // ManagingOrders state, leaving the window stuck open.
-                            *state.manage_orders_deadline.write() = None;
+                            *state.bazaar.manage_orders_deadline.write() = None;
                             *state.bot_state.write() = BotState::Idle;
                         }
 
@@ -4623,7 +4437,7 @@ async fn handle_window_interaction(
                 // This means the order is OPEN (not filled — filled orders collect on click).
                 // After handling ONE order, close and go Idle (one order per cycle).
 
-                let order_ctx = state.managing_order_context.read().clone();
+                let order_ctx = state.bazaar.managing_order_context.read().clone();
                 let (order_name, order_identity, order_filled_amount) = match &order_ctx {
                     Some((_is_buy, name, identity, filled)) => (name.clone(), identity.clone(), *filled),
                     None => (String::new(), None, None),
@@ -4631,20 +4445,20 @@ async fn handle_window_interaction(
                 let order_identity_for_clean = order_ctx.as_ref().and_then(|(_, _, id, _)| id.clone());
 
                 let name_key = normalize_bazaar_order_text(&order_name);
-                if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
+                if !name_key.is_empty() && state.bazaar.manage_orders_processed.read().contains(&name_key) {
                     debug!("[ManageOrders] Order \"{}\" already processed — closing", order_name);
                     send_raw_close(bot, window_id, &state.handlers);
-                    *state.manage_orders_deadline.write() = None;
+                    *state.bazaar.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
                 } else {
                 // Determine cancel_due_to_age BEFORE deciding whether to skip.
                 // This allows stale orders to be cancelled even in collect-only mode.
                 let cancel_due_to_age = !cancel_open
-                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes_per_million);
+                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar.cancel_minutes_per_million);
 
                 // Check cancel retry limit early — if exceeded, close immediately.
                 let cancel_fail_key = normalize_bazaar_order_text(&order_name);
-                let prior_failures = *state.order_cancel_failures.read().get(&cancel_fail_key).unwrap_or(&0);
+                let prior_failures = *state.bazaar.order_cancel_failures.read().get(&cancel_fail_key).unwrap_or(&0);
                 let cancel_exceeded = prior_failures >= MAX_CANCEL_RETRIES;
 
                 if cancel_exceeded && (cancel_open || cancel_due_to_age) {
@@ -4653,13 +4467,13 @@ async fn handle_window_interaction(
                         order_name, MAX_CANCEL_RETRIES
                     );
                     if !name_key.is_empty() {
-                        state.manage_orders_processed.write().insert(name_key);
+                        state.bazaar.manage_orders_processed.write().insert(name_key);
                     }
                     if *state.last_window_id.read() == window_id {
                         send_raw_close(bot, window_id, &state.handlers);
                     }
-                    *state.manage_orders_deadline.write() = None;
-                    state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                    *state.bazaar.manage_orders_deadline.write() = None;
+                    state.bazaar.at_limit.store(false, Ordering::Relaxed);
                     *state.bot_state.write() = BotState::Idle;
                 } else if !cancel_open && !cancel_due_to_age {
                     // Collect-only mode and order is NOT stale.
@@ -4712,12 +4526,12 @@ async fn handle_window_interaction(
                     }
 
                     if !name_key.is_empty() {
-                        state.manage_orders_processed.write().insert(name_key);
+                        state.bazaar.manage_orders_processed.write().insert(name_key);
                     }
                     if *state.last_window_id.read() == window_id {
                         send_raw_close(bot, window_id, &state.handlers);
                     }
-                    *state.manage_orders_deadline.write() = None;
+                    *state.bazaar.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
 
                     // Re-queue so remaining orders are processed without
@@ -4780,7 +4594,7 @@ async fn handle_window_interaction(
                 if cancel_due_to_age && cancel_slot.is_some() {
                     info!(
                         "[ManageOrders] Open order \"{}\" exceeds cancel threshold ({}m/M) — will cancel (Order options)",
-                        order_name, state.bazaar_order_cancel_minutes_per_million
+                        order_name, state.bazaar.cancel_minutes_per_million
                     );
                 }
 
@@ -4808,7 +4622,7 @@ async fn handle_window_interaction(
                                     click_window_slot(bot, &state.last_window_id, window_id, cancel_after as i16).await;
                                     if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                         *state.manage_orders_cancelled.write() += 1;
-                                        state.order_cancel_failures.write().remove(&cancel_fail_key);
+                                        state.bazaar.order_cancel_failures.write().remove(&cancel_fail_key);
                                         if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
                                             let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                                 item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
@@ -4817,7 +4631,7 @@ async fn handle_window_interaction(
                                             });
                                         }
                                     } else {
-                                        *state.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
+                                        *state.bazaar.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
                                         warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
                                     }
                                 }
@@ -4831,7 +4645,7 @@ async fn handle_window_interaction(
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                             if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                 *state.manage_orders_cancelled.write() += 1;
-                                state.order_cancel_failures.write().remove(&cancel_fail_key);
+                                state.bazaar.order_cancel_failures.write().remove(&cancel_fail_key);
                                 if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
                                     let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                         item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
@@ -4840,7 +4654,7 @@ async fn handle_window_interaction(
                                     });
                                 }
                             } else {
-                                *state.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
+                                *state.bazaar.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
                                 warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
                             }
                         }
@@ -4853,13 +4667,13 @@ async fn handle_window_interaction(
 
                 // Mark as processed, close, and go Idle (one order per cycle)
                 if !name_key.is_empty() {
-                    state.manage_orders_processed.write().insert(name_key);
+                    state.bazaar.manage_orders_processed.write().insert(name_key);
                 }
                 if *state.last_window_id.read() == window_id {
                     send_raw_close(bot, window_id, &state.handlers);
                 }
-                *state.manage_orders_deadline.write() = None;
-                state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                *state.bazaar.manage_orders_deadline.write() = None;
+                state.bazaar.at_limit.store(false, Ordering::Relaxed);
                 *state.bot_state.write() = BotState::Idle;
 
                 // Re-queue so remaining orders are processed promptly.
@@ -4889,19 +4703,19 @@ async fn handle_window_interaction(
             // Sell whole inventory instantly via /bz → "Sell Inventory Now"
             // → "Selling whole inventory" (slot 11).
             //
-            // Flow (reuses bazaar_step for sub-state):
-            //   Initial          — bazaar main page: find & click "Sell Inventory Now"
-            //   SearchResults    — confirmation page: click slot 11 to confirm
+            // Flow (tracked by sell_inventory_step):
+            //   Initial       — bazaar main page: find & click "Sell Inventory Now"
+            //   ConfirmWindow — confirmation page: click slot 11 to confirm
             //
             // If inventory has no instasellable items, Hypixel sends
             // "You don't have anything to sell!" in chat and does not open
             // the confirmation window.
-            let step = *state.bazaar_step.read();
+            let step = *state.bazaar.sell_inventory_step.read();
             if *state.last_window_id.read() != window_id {
                 return;
             }
 
-            if step == BazaarStep::Initial && window_title.contains("Bazaar") {
+            if step == SellInventoryStep::Initial && window_title.contains("Bazaar") {
                 // Bazaar page (main or category) — find "Sell Inventory Now"
                 // button dynamically.
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -4909,9 +4723,9 @@ async fn handle_window_interaction(
                 let slots = bot.menu().slots();
                 let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now").unwrap_or(SELL_INVENTORY_NOW_FALLBACK_SLOT);
                 info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot {}", sell_inv_slot);
-                *state.bazaar_step.write() = BazaarStep::SearchResults;
+                *state.bazaar.sell_inventory_step.write() = SellInventoryStep::ConfirmWindow;
                 click_window_slot(bot, &state.last_window_id, window_id, sell_inv_slot as i16).await;
-            } else if step == BazaarStep::SearchResults {
+            } else if step == SellInventoryStep::ConfirmWindow {
                 // Confirmation page — click slot 11 ("Selling whole inventory")
                 info!("[SellInventoryBz] Confirmation window open — clicking slot 11 to sell");
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -4920,7 +4734,7 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 info!("[SellInventoryBz] Done — closing window and going idle");
                 send_raw_close(bot, window_id, &state.handlers);
-                *state.bazaar_step.write() = BazaarStep::Initial;
+                *state.bazaar.sell_inventory_step.write() = SellInventoryStep::Initial;
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -5705,7 +5519,7 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
     info!("[MyAuctions] Cached {} auction entries from Manage Auctions window", auctions.len());
 
     if let Ok(json_str) = serde_json::to_string(&auctions) {
-        *state.cached_my_auctions_json.write() = Some(json_str);
+        *state.auction.cached_my_auctions_json.write() = Some(json_str);
     }
 }
 
@@ -6096,13 +5910,13 @@ fn check_manage_orders_deadline(
     state: &BotClientState,
     window_id: u8,
 ) -> bool {
-    if let Some(deadline) = *state.manage_orders_deadline.read() {
+    if let Some(deadline) = *state.bazaar.manage_orders_deadline.read() {
         if tokio::time::Instant::now() >= deadline {
             warn!("[ManageOrders] Internal deadline exceeded — closing window and going Idle");
             send_raw_close(bot, window_id, &state.handlers);
-            *state.manage_orders_deadline.write() = None;
+            *state.bazaar.manage_orders_deadline.write() = None;
             // Clear the order-limit flag so new flips aren't blocked after timeout.
-            state.bazaar_at_limit.store(false, Ordering::Relaxed);
+            state.bazaar.at_limit.store(false, Ordering::Relaxed);
             *state.bot_state.write() = BotState::Idle;
             return true;
         }
@@ -6112,8 +5926,8 @@ fn check_manage_orders_deadline(
     if state.bazaar_flips_paused.load(Ordering::Relaxed) {
         info!("[ManageOrders] AH flips incoming — aborting ManageOrders to free queue");
         send_raw_close(bot, window_id, &state.handlers);
-        *state.manage_orders_deadline.write() = None;
-        state.bazaar_at_limit.store(false, Ordering::Relaxed);
+        *state.bazaar.manage_orders_deadline.write() = None;
+        state.bazaar.at_limit.store(false, Ordering::Relaxed);
         *state.bot_state.write() = BotState::Idle;
         return true;
     }
