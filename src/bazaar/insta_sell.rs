@@ -3,12 +3,13 @@ use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 use crate::types::BotState;
 use crate::bot::client::{
-    BotClientState, InstaSellStep,
+    BotClientState,
     // utility fns (pub(crate) in client.rs)
     click_window_slot, send_chat_command,
     send_raw_close,
-    find_slot_by_name,
+    find_slot_by_name
 };
+use crate::bot::steps::{InstaSellStep};
 
 
 pub async fn handle_window_insta_selling(

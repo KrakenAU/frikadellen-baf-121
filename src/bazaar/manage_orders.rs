@@ -16,10 +16,9 @@ use crate::bot::client::{
     log_pending_claim, check_manage_orders_deadline,
     close_window_and_reopen_bz,
     wait_for_cancel_confirmation, wait_for_collect_confirmation,
-    count_empty_player_slots,
-    MANAGE_ORDERS_FALLBACK_SLOT,
-    MAX_CANCEL_RETRIES, MIN_FREE_SLOTS_FOR_BUY,
+    count_empty_player_slots
 };
+use crate::bot::constants::{MANAGE_ORDERS_FALLBACK_SLOT, MAX_CANCEL_RETRIES, MIN_FREE_SLOTS_FOR_BUY};
 use crate::bot::client::normalize_bazaar_order_text;
 
 

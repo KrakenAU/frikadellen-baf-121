@@ -3,7 +3,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 use parking_lot::RwLock;
 
-use crate::bot::client::{AuctionStep, BazaarStep, InstaSellStep, SellInventoryStep};
+use crate::bot::steps::{AuctionStep, BazaarStep, InstaSellStep, SellInventoryStep};
 
 /// All bazaar-specific runtime fields, grouped out of BotClientState.
 ///

@@ -2,12 +2,14 @@ use azalea::prelude::*;
 use tracing::info;
 use crate::types::BotState;
 use crate::bot::client::{
-    BotClientState, SellInventoryStep,
+    BotClientState,
     // utility fns (pub(crate) in client.rs)
     click_window_slot,
     send_raw_close,
-    find_slot_by_name, SELL_INVENTORY_NOW_FALLBACK_SLOT,
+    find_slot_by_name
 };
+use crate::bot::constants::{SELL_INVENTORY_NOW_FALLBACK_SLOT};
+use crate::bot::steps::{SellInventoryStep};
 
 
 pub async fn handle_window_selling_inventory_bz(

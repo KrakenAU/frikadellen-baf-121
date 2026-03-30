@@ -5,14 +5,14 @@ use crate::types::BotState;
 use crate::bot::client::{
     BotClientState, BotEvent,
     // step enums
-    BazaarStep,
     // utility fns (pub(crate) in client.rs)
     click_window_slot,
     send_raw_close,
     find_slot_by_name,
     get_item_display_name_from_slot,
-    log_bazaar_order_placed,
+    log_bazaar_order_placed
 };
+use crate::bot::steps::{BazaarStep};
 
 
 pub async fn handle_window_bazaar(

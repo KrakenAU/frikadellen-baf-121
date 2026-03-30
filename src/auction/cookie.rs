@@ -2,13 +2,14 @@ use azalea::prelude::*;
 use tracing::{info, warn};
 use crate::types::BotState;
 use crate::bot::client::{
-    BotClientState, BotEvent, CookieStep,
+    BotClientState, BotEvent,
     // utility fns (pub(crate) in client.rs)
     click_window_slot, send_chat_command,
     send_raw_close,
     get_item_display_name_from_slot, get_item_lore_from_slot,
-    parse_cookie_duration_secs,
+    parse_cookie_duration_secs
 };
+use crate::bot::steps::{CookieStep};
 use azalea_protocol::packets::game::s_set_carried_item::ServerboundSetCarriedItem;
 use azalea_protocol::packets::game::s_use_item::ServerboundUseItem;
 use azalea_protocol::packets::game::s_interact::InteractionHand;

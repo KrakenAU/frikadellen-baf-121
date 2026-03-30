@@ -2,11 +2,11 @@ use azalea::prelude::*;
 use std::sync::atomic::Ordering;
 use tracing::{info, debug, warn};
 use crate::types::BotState;
+use crate::bot::constants::CONFIRM_PURCHASE_RETRY_MS;
 use crate::bot::client::{
     BotClientState,
     send_raw_close, send_raw_click,
 };
-use crate::bot::client::CONFIRM_PURCHASE_RETRY_MS;
 
 
 pub async fn handle_window_purchasing(

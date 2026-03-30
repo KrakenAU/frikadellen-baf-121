@@ -20,82 +20,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error, debug, warn};
 
-use crate::types::{BotState, QueuedCommand};
+use crate::bot::parsers::{extract_viewauction_uuid, parse_purchased_message, parse_sold_message};
+use crate::bot::state::{AuctionCtx, BazaarCtx};
+use crate::bot::steps::{AuctionStep, BazaarStep, CookieStep, SellInventoryStep};
 use crate::state::CommandQueue;
+use crate::types::{BotState, QueuedCommand};
 use crate::websocket::CoflWebSocket;
-use crate::bot::state::{BazaarCtx, AuctionCtx};
+use super::constants::*;
 use super::handlers::BotEventHandlers;
-
-/// Connection wait duration (seconds) - time to wait for bot connection to establish
-const CONNECTION_WAIT_SECONDS: u64 = 2;
-
-/// Delay after spawning in lobby before sending /play sb command
-const LOBBY_COMMAND_DELAY_SECS: u64 = 3;
-
-/// Delay after detecting SkyBlock join before teleporting to island
-const ISLAND_TELEPORT_DELAY_SECS: u64 = 2;
-
-/// Wait time for island teleport to complete
-const TELEPORT_COMPLETION_WAIT_SECS: u64 = 3;
-
-/// Timeout for waiting for SkyBlock join confirmation (seconds)
-const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
-
-/// Delay before clicking accept button in trade response window (milliseconds)
-/// TypeScript waits to check for "Deal!" or "Warning!" messages before accepting
-const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
-const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
-/// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
-pub(crate) const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
-/// Brief delay after closing a stale window so Hypixel processes the
-/// container-close packet before the next command is sent.
-pub(crate) const WINDOW_CLOSE_DELAY_MS: u64 = 150;
-const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
-/// Delay before retrying the auction flow after closing a window to remove a
-/// stuck item from the auction slot.  Gives Hypixel time to process the
-/// container-close packet and return the item to inventory.
-pub(crate) const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 2000;
-/// Maximum number of retry attempts when "You already have an item in the auction
-/// slot!" keeps recurring.  After this many retries the bot gives up and goes Idle
-/// instead of looping indefinitely and risking a "Sending packets too fast!" kick.
-pub(crate) const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
-/// Fallback slot index for "Manage Orders" in the Bazaar GUI when dynamic name
-/// lookup fails.  Hypixel's default layout places it at slot 50.
-pub(crate) const MANAGE_ORDERS_FALLBACK_SLOT: usize = 50;
-/// Fallback slot index for "Sell Inventory Now" in the Bazaar GUI when dynamic
-/// name lookup fails.  Hypixel's default layout places it at slot 47.
-pub(crate) const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
-/// Debounce interval for `rebuild_cached_window_json` on `ContainerSetSlot` events.
-/// Individual slot updates are coalesced within this window to avoid excessive CPU
-/// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
-const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
-/// Debounce interval for `rebuild_cached_inventory_json` on `ContainerSetSlot` events.
-/// Same rationale as `WINDOW_CACHE_REBUILD_DEBOUNCE_MS`: coalesces rapid per-slot
-/// updates into a single rebuild to keep the ECS World lock acquisition frequency low
-/// and reduce CPU spent on repeated JSON serialisation.
-const INVENTORY_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
-/// Timeout (seconds) for `wait_for_collect_confirmation` and
-/// `wait_for_cancel_confirmation` to consider an action unprocessed.
-/// Raised from 5 → 8 to accommodate Hypixel server lag that caused
-/// frequent false "not confirmed" warnings and skipped events.
-pub(crate) const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 8;
-/// Maximum number of cancel attempts per order before giving up.
-/// After this many failed cancel clicks in Order options, the order is skipped
-/// so the bot doesn't get stuck retrying indefinitely.
-pub(crate) const MAX_CANCEL_RETRIES: u32 = 5;
-/// Minimum number of empty player-inventory slots required to consider the
-/// inventory "not full".  Used when verifying the `inventory_full` flag
-/// against actual slot counts so stale flags are auto-cleared after a manual
-/// instasell or any other action that frees space.
-pub(crate) const MIN_FREE_SLOTS_FOR_BUY: u8 = 2;
-
-
-#[cfg(test)]
-static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
-#[cfg(test)]
-static SOLD_BUYER_RE: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)").expect("valid sold-buyer regex"));
 
 // ---------------------------------------------------------------------------
 // Bevy Plugin: PacketAcceleratorPlugin
@@ -846,65 +778,6 @@ impl Default for BotClient {
         Self::new()
     }
 }
-
-/// Which step of the auction creation flow the bot is in.
-/// Matches TypeScript's setPrice/durationSet flags in sellHandler.ts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AuctionStep {
-    #[default]
-    Initial,       // Just sent /ah, waiting for "Auction House"
-    OpenManage,    // Clicked slot 15 in AH, waiting for "Manage Auctions"
-    ClickCreate,   // Clicked "Create Auction" in Manage Auctions, waiting for "Create Auction"
-    SelectBIN,     // Clicked slot 48 in "Create Auction", waiting for "Create BIN Auction"
-    PriceSign,     // Clicked item + slot 31, sign expected (setPrice=false in TS)
-    SetDuration,   // Price sign done; "Create BIN Auction" second visit → click slot 33
-    DurationSign,  // "Auction Duration" opened + slot 16 clicked; sign expected for duration
-    ConfirmSell,   // Duration sign done; "Create BIN Auction" third visit → click slot 29
-    FinalConfirm,  // In "Confirm BIN Auction" → click slot 11
-}
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BazaarStep {
-    #[default]
-    Initial,
-    SearchResults,
-    SelectOrderType,
-    SetAmount,
-    SetPrice,
-    Confirm,
-}
-
-/// Steps for the InstaSelling flow (separate from bazaar order placement).
-/// BotState::InstaSelling uses this instead of reusing BazaarStep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InstaSellStep {
-    #[default]
-    FindItem,       // /bz opened — searching for the item in results
-    FindSellButton, // On item detail page — looking for "Sell Instantly"
-    WaitConfirm,    // On confirmation/warning page — waiting for "Confirm" button
-}
-
-/// Steps for the SellingInventoryBz flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SellInventoryStep {
-    #[default]
-    Initial,       // Bazaar main page — clicking "Sell Inventory Now"
-    ConfirmWindow, // Confirmation page — clicking slot 11 to sell
-}
-
-/// Sub-steps within the BuyingCookie state.
-/// Matches TypeScript cookieHandler.ts buyCookie() flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CookieStep {
-    #[default]
-    Initial,         // Sent /bz booster cookie, waiting for Bazaar window
-    ItemDetail,      // Clicked cookie item (slot 11), waiting for detail window
-    BuyConfirm,      // Clicked Buy Instantly (slot 10), waiting for confirm window
-    WaitingForCookie, // Clicked Confirm, waiting for cookie to appear in inventory
-    ConsumingCookie, // Right-clicked cookie, waiting for cookie GUI window
-}
-
 /// State type for bot client event handler
 #[derive(Clone, Component)]
 pub struct BotClientState {
@@ -4206,78 +4079,10 @@ async fn run_startup_workflow(
     startup_in_progress.store(false, Ordering::Relaxed);
     let _ = event_tx.send(BotEvent::StartupComplete { orders_cancelled });
 }
-
-/// Parse "You purchased <item> for <price> coins!" → (item_name, price)
-pub(crate) fn parse_purchased_message(msg: &str) -> Option<(String, u64)> {
-    // "You purchased <item> for <price> coins!"
-    let after = msg.strip_prefix("You purchased ")?;
-    let for_idx = after.rfind(" for ")?;
-    let item_name = after[..for_idx].to_string();
-    let rest = &after[for_idx + 5..];
-    let coins_idx = rest.find(" coins")?;
-    let price_str = rest[..coins_idx].replace(',', "");
-    let price: u64 = price_str.trim().parse().ok()?;
-    Some((item_name, price))
-}
-
-/// Parse "[Auction] <buyer> bought <item> for <price> coins" → (buyer, item_name, price)
-pub(crate) fn parse_sold_message(msg: &str) -> Option<(String, String, u64)> {
-    // "[Auction] <buyer> bought <item> for <price> coins"
-    let after = msg.strip_prefix("[Auction] ")?;
-    let bought_idx = after.find(" bought ")?;
-    let buyer = after[..bought_idx].to_string();
-    let rest = &after[bought_idx + 8..];
-    let for_idx = rest.rfind(" for ")?;
-    let item_name = rest[..for_idx].to_string();
-    let rest2 = &rest[for_idx + 5..];
-    let coins_idx = rest2.find(" coins")?;
-    let price_str = rest2[..coins_idx].replace(',', "");
-    let price: u64 = price_str.trim().parse().ok()?;
-    Some((buyer, item_name, price))
-}
-
-#[cfg(test)]
-fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Option<(String, u64, String)> {
-    if lore.is_empty() {
-        return None;
-    }
-    let combined = lore.join("\n");
-    let combined_lower = combined.to_lowercase();
-    let sold_status = (combined_lower.contains("status:") && combined_lower.contains("sold"))
-        || combined_lower.contains("sold for");
-    if !sold_status {
-        return None;
-    }
-
-    let price_caps = SOLD_FOR_PRICE_RE.captures(&combined)?;
-    let price_match = price_caps.get(1)?;
-    let price: u64 = price_match.as_str().replace(',', "").trim().parse().ok()?;
-
-    let buyer = SOLD_BUYER_RE
-        .captures(&combined)
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    Some((item_name.to_string(), price, buyer))
-}
-
-/// Extract UUID from a message that might contain "/viewauction <UUID>".
-/// Works in both plain-text context (UUID ends at whitespace) and JSON context
-/// (UUID ends at `"` after the value string, e.g. from a serialized clickEvent).
-/// Minecraft UUIDs consist only of hex digits and dashes, so `"` is never a valid
-/// UUID character — using it as a terminator is unconditionally safe.
-pub(crate) fn extract_viewauction_uuid(msg: &str) -> Option<String> {
-    let idx = msg.find("/viewauction ")?;
-    let rest = &msg[idx + 13..];
-    let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
-    let uuid = rest[..end].trim().to_string();
-    if uuid.is_empty() { None } else { Some(uuid) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bot::parsers::parse_claimed_sold_event_from_lore;
     use azalea::registry::builtin::ItemKind;
     use azalea_inventory::components::MapId;
     use azalea_inventory::ItemStack;

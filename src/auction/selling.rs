@@ -3,13 +3,14 @@ use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 use crate::types::BotState;
 use crate::bot::client::{
-    BotClientState, AuctionStep,
+    BotClientState,
     // utility fns (pub(crate) in client.rs)
     click_window_slot,
     send_raw_close,
     find_slot_by_name, get_item_lore_from_slot,
-    clear_auction_preview_slot, click_window_slot_carrying,
+    clear_auction_preview_slot, click_window_slot_carrying
 };
+use crate::bot::steps::{AuctionStep};
 
 
 pub async fn handle_window_selling(
